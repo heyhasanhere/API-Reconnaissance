@@ -1,0 +1,13 @@
+{
+  "name": "api-recon-helper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright helper for api-recon — captures browser traffic as JSONL for the Go side to ingest.",
+  "scripts": {
+    "install-browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

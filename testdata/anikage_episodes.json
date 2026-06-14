@@ -1,0 +1,23 @@
+[
+  {
+    "id": "e1f0a2b4-c3d4-4e5f-8a9b-0c1d2e3f4a5b",
+    "number": 1,
+    "title": "The Journey Begins",
+    "slug": "e1f0a2b4",
+    "img": "https://cdn.anikage.cc/thumbs/frieren/01.jpg"
+  },
+  {
+    "id": "a2b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+    "number": 2,
+    "title": "A New Companion",
+    "slug": "a2b3c4d5",
+    "img": "https://cdn.anikage.cc/thumbs/frieren/02.jpg"
+  },
+  {
+    "id": "b3c4d5e6-f7a8-4b9c-ad0e-2f3a4b5c6d7e",
+    "number": 3,
+    "title": "The Town of Magic",
+    "slug": "b3c4d5e6",
+    "img": "https://cdn.anikage.cc/thumbs/frieren/03.jpg"
+  }
+]
