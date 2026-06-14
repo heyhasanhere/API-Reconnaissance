@@ -8,18 +8,49 @@ re-run on demand. See `examples/anikage.md` for the worked example.
 
 ## Install
 
+`api-recon` is a Go module (`github.com/falcon/api-recon`, go 1.26.4,
+no runtime deps). The `watch` and `click` REPL actions also need
+Playwright; everything else works without it.
+
+### Local install (you have the source)
+
 ```bash
-go install github.com/falcon/api-recon@latest
+cd /path/to/api-recon
+go install .
 ```
 
-The `watch` and `click` REPL actions also need Playwright:
+This places the `api-recon` binary in `$GOBIN` (default
+`~/go/bin/`). Add that to your `PATH` once:
+
+```bash
+echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+After this, `api-recon --version` works from any directory. Re-run
+`go install .` from the project root to pick up new commits.
+
+### Clone + build (anyone else)
+
+```bash
+git clone <repo-url> api-recon
+cd api-recon
+go install .
+```
+
+The repo URL is whatever your `git remote -v` reports. The module
+path in `go.mod` doesn't have to match the URL, but they do need
+to match for `go install <url>@latest` to work without a clone.
+
+### Playwright (only if you use `watch` or `click`)
 
 ```bash
 npm install && npx playwright install chromium
 ```
 
-`api-recon` will print a one-line install hint on startup if
-Playwright is missing. Everything else works without it.
+`api-recon` prints a one-line install hint on REPL startup if
+Playwright is missing. The basic probe/harvest/verify/run path
+doesn't need it.
 
 ## Usage
 
@@ -32,6 +63,28 @@ api-recon show <domain>                # print a recipe
 api-recon verify <domain>              # re-probe endpoints, report drift
 api-recon recipe edit <domain>         # open in $EDITOR (or vi)
 ```
+
+### Where recipes go
+
+By default, recipes are written to two places, in lookup order:
+
+1. `./.api-recon/recipes/` — project-local, if the current
+   directory is writable.
+2. `~/.local/share/api-recon/recipes/` — XDG global (or
+   `$XDG_DATA_HOME/api-recon/recipes/` if set).
+
+`api-recon --store <dir>` overrides the writer. Useful when
+you're working outside a project directory:
+
+```bash
+api-recon --store ~/notes/anime/.api-recon harvest <url>
+api-recon --store ~/notes/anime/.api-recon ls
+api-recon --store ~/notes/anime/.api-recon run anikage.cc
+```
+
+Files are mode 0600 (recipes may contain captured auth tokens).
+Writes are atomic — a failed write leaves the previous recipe
+intact, never a half-written file.
 
 Global flags:
 
