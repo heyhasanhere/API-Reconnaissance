@@ -244,7 +244,7 @@ func runREPL(ctx context.Context, entryURL, storeDirOverride string) error {
 	}
 	// Add the run/show subcommands as actions too, so they're
 	// reachable from the REPL.
-	actions = append(actions, runAction(st), showAction(st), listAction(st), verifyAction(st), editAction(st))
+	actions = append(actions, runAction(st), showAction(st), listAction(st), verifyAction(st), editAction(st), saveAction(st))
 
 	r := repl.New(c, actions)
 	if entryURL != "" {
@@ -409,7 +409,15 @@ func verifyRecipe(ctx context.Context, st *store.Store, domain string) error {
 			drift++
 			continue
 		}
-		statusOK := status >= 200 && status < 400
+		// For non-error endpoints we expect 2xx/3xx; for
+		// error-shape endpoints we expect 4xx/5xx. The shape
+		// itself must match in either case.
+		var statusOK bool
+		if ep.Shape == "error" {
+			statusOK = status >= 400
+		} else {
+			statusOK = status >= 200 && status < 400
+		}
 		shapeOK := shapeKind == ep.Shape
 		sym := "✓"
 		if !statusOK || !shapeOK {
@@ -527,21 +535,66 @@ func listAction(st *store.Store) action.Action {
 func showAction(st *store.Store) action.Action {
 	return action.Action{
 		Name:     "show",
-		Summary:  "Show a saved recipe",
+		Summary:  "Show a recipe (in-memory if not yet saved)",
 		Category: "meta",
 		Run: func(ctx context.Context, c *action.Context, args []string) (*action.Result, error) {
 			if len(args) == 0 {
-				return nil, fmt.Errorf("show: domain is required")
+				// No arg: show the in-memory recipe if we have one.
+				if c.Recipe != nil && c.Recipe.Domain != "" {
+					printRecipe(c.Stdout, c.Recipe, "(in-memory, not yet saved)")
+					return &action.Result{Summary: "showed " + c.Recipe.Domain + " (in-memory)"}, nil
+				}
+				return nil, fmt.Errorf("show: domain is required (or no in-memory recipe yet)")
 			}
 			r, err := st.Lookup(args[0])
 			if err != nil {
+				// Fall back to the in-memory recipe if the domain matches.
+				if c.Recipe != nil && c.Recipe.Domain == args[0] {
+					printRecipe(c.Stdout, c.Recipe, "(in-memory, not yet saved)")
+					return &action.Result{Summary: "showed " + args[0] + " (in-memory)"}, nil
+				}
 				return nil, err
 			}
-			fmt.Fprintf(c.Stdout, "# %s\n", r.Domain)
-			for name, ep := range r.Endpoints {
-				fmt.Fprintf(c.Stdout, "  %s: %s %s (%s)\n", name, ep.Method, ep.URL, ep.Shape)
-			}
+			printRecipe(c.Stdout, r, "(on disk)")
 			return &action.Result{Summary: "showed " + args[0]}, nil
+		},
+	}
+}
+
+// printRecipe writes a human-readable recipe to w.
+func printRecipe(w io.Writer, r *recipe.Recipe, note string) {
+	fmt.Fprintf(w, "# %s %s\n", r.Domain, note)
+	if !r.Discovered.IsZero() {
+		fmt.Fprintf(w, "  discovered: %s\n", r.Discovered.Format("2006-01-02"))
+	}
+	fmt.Fprintf(w, "  endpoints: %d\n", len(r.Endpoints))
+	for name, ep := range r.Endpoints {
+		fmt.Fprintf(w, "  %s: %s %s (%s)\n", name, ep.Method, ep.URL, ep.Shape)
+	}
+}
+
+// saveAction persists the in-memory recipe to the store. Used at
+// the end of a discovery session to commit what was learned.
+func saveAction(st *store.Store) action.Action {
+	return action.Action{
+		Name:     "save",
+		Summary:  "Save the in-memory recipe to disk",
+		Category: "meta",
+		Run: func(ctx context.Context, c *action.Context, args []string) (*action.Result, error) {
+			if c.Recipe == nil || c.Recipe.Domain == "" {
+				return nil, fmt.Errorf("save: no recipe in memory (run harvest first)")
+			}
+			if c.Recipe.Discovered.IsZero() {
+				c.Recipe.Discovered = time.Now()
+			}
+			if err := st.Save(c.Recipe); err != nil {
+				return nil, fmt.Errorf("save: %w", err)
+			}
+			path := st.Path(c.Recipe.Domain)
+			return &action.Result{
+				Summary: fmt.Sprintf("saved recipe for %s to %s", c.Recipe.Domain, path),
+				Tags:    []string{"recipe:saved"},
+			}, nil
 		},
 	}
 }
