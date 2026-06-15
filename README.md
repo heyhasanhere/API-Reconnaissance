@@ -8,9 +8,10 @@ re-run on demand. See `examples/anikage.md` for the worked example.
 
 ## Install
 
-`api-recon` is a Go module (`github.com/falcon/api-recon`, go 1.26.4,
-no runtime deps). The `watch` and `click` REPL actions also need
-Playwright; everything else works without it.
+`api-recon` is a Go module
+(`github.com/heyhasanhere/API-Reconnaissance`, go 1.26.4, no runtime
+deps). The `watch` and `click` REPL actions also need Playwright;
+everything else works without it.
 
 ### Local install (you have the source)
 
@@ -33,14 +34,17 @@ After this, `api-recon --version` works from any directory. Re-run
 ### Clone + build (anyone else)
 
 ```bash
-git clone <repo-url> api-recon
-cd api-recon
+git clone https://github.com/heyhasanhere/API-Reconnaissance.git
+cd API-Reconnaissance
 go install .
 ```
 
-The repo URL is whatever your `git remote -v` reports. The module
-path in `go.mod` doesn't have to match the URL, but they do need
-to match for `go install <url>@latest` to work without a clone.
+The module path matches the GitHub URL, so once the repo is public
+this also works directly:
+
+```bash
+go install github.com/heyhasanhere/API-Reconnaissance@latest
+```
 
 ### Playwright (only if you use `watch` or `click`)
 
@@ -55,14 +59,23 @@ doesn't need it.
 ## Usage
 
 ```bash
-api-recon [url]                        # enter REPL (auto-probe if url given)
-api-recon harvest <url>                # guided discovery for a domain
-api-recon run <domain> [args...]       # replay a saved recipe
-api-recon ls                           # list known domains
-api-recon show <domain>                # print a recipe
-api-recon verify <domain>              # re-probe endpoints, report drift
-api-recon recipe edit <domain>         # open in $EDITOR (or vi)
+api-recon --version          # 0.1.0
+api-recon --help             # full usage
+api-recon [url]              # enter REPL (auto-probe if url given)
+api-recon ls                 # list known domains
+api-recon show <domain>      # print a recipe
+api-recon run <domain> ...   # replay a saved recipe
+api-recon verify <domain>    # re-probe endpoints, report drift
+api-recon recipe edit <d>    # open in $EDITOR (or vi)
 ```
+
+Global flags:
+
+- `--json` — scriptable output for subcommands
+- `--no-repl` — force subcommand mode even when a URL is given
+- `--store <dir>` — override the recipe store location
+- `--help`, `-h` — show help
+- `--version` — print version
 
 ### Where recipes go
 
@@ -86,13 +99,201 @@ Files are mode 0600 (recipes may contain captured auth tokens).
 Writes are atomic — a failed write leaves the previous recipe
 intact, never a half-written file.
 
-Global flags:
+## Walkthrough: the anikage case
 
-- `--json` — scriptable output for subcommands
-- `--no-repl` — force subcommand mode even when a URL is given
-- `--store <dir>` — override the recipe store location
-- `--help`, `-h` — show help
-- `--version` — print version
+This is the canonical flow. Outputs below are real, captured from
+the binary.
+
+### 1. Enter the REPL with a URL
+
+```bash
+$ api-recon https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes
+Entering REPL. Auto-probing https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes ...
+probed https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes → 200 (json_list, 12279 bytes)
+  hint: list of 28 items
+  hint: list with id field "id" — try drilling into one item
+
+api-recon [anikage.cc] >
+   1. harvest — Discover and capture a domain's API
+   2. help — Show help for an action
+   3. ls — List known domains
+   4. recipe edit — Open a recipe in $EDITOR (or vi)
+   5. save — Save the in-memory recipe to disk
+   6. show — Show a recipe (in-memory if not yet saved)
+   7. run — Replay a saved recipe
+   8. verify — Re-probe a recipe's endpoints, report drift
+   q. Quit
+
+pick a number, name, or 'q':
+```
+
+The tool auto-probed the URL once. The shape classifier saw a
+top-level JSON array and named it `json_list` (28 items, `id`
+field detected). The `anikage.cc` host is now the in-flight
+recipe's domain — that's what `[anikage.cc]` in the prompt
+shows.
+
+### 2. Drill into a child endpoint
+
+```bash
+pick a number, name, or 'q': harvest https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub
+  probed https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub → 404 (error, 23 bytes)
+  hint: error: Not found
+
+api-recon [anikage.cc] >
+   1. harvest — Discover and capture a domain's API
+   2. help — Show help for an action
+   ...
+
+Next suggestions:
+  extract values from the error and try them
+  error response — likely a value or path mismatch
+  5xx — boundary fuzzing might find a working value
+
+pick a number, name, or 'q':
+```
+
+The `harvest` action takes a URL after it. This URL returned 404
+with `{"message":"Not found"}`. The classifier caught the 4xx
+and the JSON envelope, and put the message into a hint. The
+shape was recorded as `error` (this is a real failure of the
+live anikage site — the example historically used a `miko`
+provider that no longer returns a 200).
+
+### 3. Inspect the in-memory recipe
+
+```bash
+pick a number, name, or 'q': show
+# anikage.cc (in-memory, not yet saved)
+  discovered: 2026-06-15
+  endpoints: 2
+  episodes: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes (json_list)
+  sources:  GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub (error)
+
+  showed anikage.cc (in-memory)
+```
+
+Two endpoints recorded so far. `show` with no arg shows the
+in-memory recipe; with `<domain>` it falls back to disk. Each
+endpoint is named from the last URL path segment, has its
+discovered method, and its classified shape.
+
+### 4. Save and exit
+
+```bash
+pick a number, name, or 'q': save
+  saved recipe for anikage.cc to /tmp/empty-demo/anikage.cc.json
+
+pick a number, name, or 'q': q
+bye.
+```
+
+The save is atomic (write to `*.tmp` with mode 0600, fsync,
+rename) and the file is human-readable JSON.
+
+### 5. Use the subcommands from the shell
+
+#### `ls`
+
+```bash
+$ api-recon ls
+anikage.cc
+```
+
+With `--json`, output is one domain per line (scriptable).
+
+#### `show <domain>`
+
+```bash
+$ api-recon show anikage.cc
+# anikage.cc
+discovered: 2026-06-15
+endpoints: 2
+  episodes: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes (json_list)
+  sources: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub (error)
+```
+
+#### `show --json <domain>`
+
+```bash
+$ api-recon --json show anikage.cc
+{
+  "schema_version": 1,
+  "domain": "anikage.cc",
+  "discovered": "2026-06-15T00:33:43.546768Z",
+  "updated": "2026-06-15T00:33:44.297442Z",
+  "endpoints": {
+    "episodes": {
+      "url": "https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes",
+      "method": "GET",
+      "shape": "json_list"
+    },
+    "sources": {
+      "url": "https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko\u0026lang=sub",
+      "method": "GET",
+      "params": [
+        "provider",
+        "lang"
+      ],
+      "shape": "error"
+    }
+  },
+  "auth": {
+    "required_headers": {
+      "User-Agent": "api-recon/0.1.0"
+    }
+  }
+}
+```
+
+The recipe is the on-disk artifact. Edit it by hand with
+`api-recon recipe edit anikage.cc`.
+
+#### `verify <domain>`
+
+```bash
+$ api-recon verify anikage.cc
+verifying anikage.cc (2 endpoints)
+  ✓ episodes: 200 json_list (expected json_list)
+  ✓ sources: 404 error (expected error)
+
+2/2 match recipe — no drift detected.
+```
+
+Re-probes every endpoint in the recipe and compares the
+recorded shape. For `error`-shape endpoints, a 4xx/5xx is the
+*expected* response and doesn't count as drift. For other
+shapes, anything outside 2xx-3xx counts as drift.
+
+#### `run <domain>`
+
+```bash
+$ api-recon run anikage.cc
+  episodes: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes
+    -> 200 json_list
+  sources: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub
+    -> 404 error
+```
+
+Probes every endpoint. Positional args after `<domain>` fill the
+**main endpoint's** placeholders in order (the main endpoint is
+`"sources"` if present, else the first endpoint with
+placeholders, else the first endpoint overall). The same
+parts map is then applied to every endpoint — endpoints with
+placeholders the args don't cover are reported as
+`skip (no parts: ...)` because `recipe.Fill` is strict.
+The `run` path leaves the user with a populated `graph.Graph`
+alongside the printed output.
+
+#### `recipe edit <domain>`
+
+```bash
+$ EDITOR=vim api-recon recipe edit anikage.cc
+# opens $EDITOR (or vi) on the saved recipe JSON
+```
+
+Falls back to `vi` if `$EDITOR` is unset. Edits are saved
+back to the same atomic-write path the REPL uses.
 
 ## How it works
 
@@ -116,7 +317,7 @@ and content-type and picks one of:
 - `direct` — known video extension with a large content-length
 - `segment_list` — JSON array of URL strings
 - `html` / `form` — HTML pages, with form-action detection
-- `error` — 5xx with structured error envelope
+- `error` — 4xx/5xx with structured error envelope
 - `redirect` — 3xx
 - `unknown` — fallback
 
@@ -127,50 +328,6 @@ uses to suggest "try a sibling under the same prefix." The **creds**
 store tracks captured headers per host with the URL they were first
 seen on, so the REPL can suggest "refresh the token via the captured
 endpoint" on a 401.
-
-## The REPL
-
-The REPL is the default mode. Given a URL, it auto-probes and
-emits a menu of next steps based on what it learned. Suggestions
-are starred.
-
-```
-$ api-recon https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes
-api-recon [anikage.cc] >
-   1. harvest — Discover and capture a domain's API
-   2. help — Show help for an action
-   3. ls — List known domains
-   4. recipe edit — Open a recipe in $EDITOR (or vi)
-   5. show — Show a saved recipe
-   6. run — Replay a saved recipe
-   7. verify — Re-probe a recipe's endpoints, report drift
-   q. Quit
-
-  ★ Try /episodes/{id}/sources — same prefix, sibling found
-  ★ Drill into one episode — pick an id
-
-pick a number, name, or 'q':
-```
-
-`help <action>` shows flags, examples, and what the action does.
-`q` quits without saving.
-
-## Subcommands
-
-`api-recon` defaults to the REPL. Pass a subcommand to script it.
-
-| Subcommand | What it does |
-|------------|--------------|
-| `harvest <url>` | Enter the REPL with a URL pre-loaded |
-| `run <domain> [args...]` | Replay a saved recipe; positional args fill placeholders in order |
-| `ls` | List known domains (project + global, deduplicated) |
-| `show <domain>` | Print a recipe (or `--json` for the raw JSON) |
-| `verify <domain>` | Re-probe every endpoint, report drift against the recorded shape |
-| `recipe edit <domain>` | Open the recipe in `$EDITOR` (falls back to `vi`) |
-
-`run` is the headline subcommand: one invocation replays the
-discovery, fills the placeholders from the positional args, and
-exercises every endpoint in the recipe.
 
 ## Design notes
 
@@ -185,6 +342,9 @@ exercises every endpoint in the recipe.
 - **No flag explosion.** Global flags are `--json`, `--no-repl`,
   `--store`, `--help`, `--version`. Per-action flags exist on the
   action's metadata, not as top-level flags.
+- **Module path matches the GitHub URL.** The `go.mod` module
+  is `github.com/heyhasanhere/API-Reconnaissance` so
+  `go install <url>@latest` resolves once the repo is public.
 
 See `.context/PLAN.md` for the full design and `.context/LOG.md` for
 the chronological log of the anikage investigation that seeded the
