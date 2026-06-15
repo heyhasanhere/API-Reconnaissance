@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 
@@ -53,6 +54,14 @@ type Discovery struct {
 	lastSiblingBody  []byte
 	lastSiblingSha   classify.Shape
 	CandidateBases   []string // cross-host API bases from bundle scan
+
+	// verbose, when true, makes d.log() also write each line to
+	// stream (if non-nil) as it's appended. Use a *bufio.Writer
+	// wrapping stderr for line-buffered streaming output. The
+	// chain engine doesn't flush for you — caller flushes after
+	// Run returns (or periodically for long runs).
+	verbose bool
+	stream  io.Writer
 }
 
 // Step records one probe and its outcome.
@@ -91,15 +100,38 @@ type FinalState struct {
 	RequiredHdrs map[string]string
 }
 
+// RunOptions configures Run's verbosity and streaming output.
+// A nil *RunOptions means "no streaming, no verbose logging" —
+// the default behavior. With Stream set, every log line is
+// written to the writer as it's appended (so the user sees
+// probe decisions in real time, not just the final summary).
+type RunOptions struct {
+	// Verbose enables per-probe log lines (e.g. "GET X → 200 OK
+	// (17 KB, json_list)"). Off by default — without this, the
+	// chain engine only logs "discovered N candidate bases"-
+	// type decisions, not every probe.
+	Verbose bool
+	// Stream, if non-nil, receives every log line as it's
+	// emitted. Wrap with *bufio.Writer to coalesce writes if
+	// you don't want one syscall per line. The chain engine
+	// does not flush Stream; the caller is responsible.
+	Stream io.Writer
+}
+
 // Run executes the 7 steps and returns a populated Discovery.
-// ctx is propagated to every probe.
-func Run(ctx context.Context, entryURL string) (*Discovery, error) {
+// ctx is propagated to every probe. opts may be nil for the
+// default (no streaming, non-verbose).
+func Run(ctx context.Context, entryURL string, opts *RunOptions) (*Discovery, error) {
 	if entryURL == "" {
 		return nil, fmt.Errorf("chain: empty entry URL")
 	}
 	d := &Discovery{
 		EntryURL: entryURL,
 		Auth:     auth.New(),
+	}
+	if opts != nil {
+		d.verbose = opts.Verbose
+		d.stream = opts.Stream
 	}
 
 	if err := d.stepResolveEntry(ctx); err != nil {
@@ -130,6 +162,7 @@ func Run(ctx context.Context, entryURL string) (*Discovery, error) {
 // --- step 1: resolve the entry URL to an API base ---
 
 func (d *Discovery) stepResolveEntry(ctx context.Context) error {
+	d.log("step 1/7: resolve entry → find API base")
 	resp, err := d.probe(ctx, d.EntryURL, "entry URL")
 	if err != nil {
 		return fmt.Errorf("step 1 (resolve entry): %w", err)
@@ -197,6 +230,7 @@ func (d *Discovery) stepDetectListEndpoint(ctx context.Context) error {
 		// Step 1 already populated episodes. Skip.
 		return nil
 	}
+	d.log("step 2/7: detect list endpoint under %s", d.APIBase)
 
 	// Build the list of candidate bases. If the bundle scan
 	// produced multiple candidates, try each. The /api and
@@ -266,6 +300,7 @@ func (d *Discovery) stepDrillIntoItem(ctx context.Context) error {
 	if len(d.Episodes) == 0 {
 		return fmt.Errorf("step 3: no episodes to drill into")
 	}
+	d.log("step 3/7: drill into item (using first episode)")
 	first := d.Episodes[0]
 	d.log("drilling into episode %d (%q)", first.Number, first.Title)
 
@@ -328,6 +363,7 @@ func (d *Discovery) stepEnumerateSiblings(ctx context.Context) error {
 	if d.resourceURL == "" {
 		return fmt.Errorf("step 4: no resource URL")
 	}
+	d.log("step 4/7: enumerate siblings of %s", d.resourceURL)
 
 	siblings := []string{"/sources", "/servers", "/streams", "/downloads", "/subtitles"}
 	for _, suf := range siblings {
@@ -364,6 +400,7 @@ func (d *Discovery) stepEnumerateProviders(ctx context.Context) error {
 	if d.lastSiblingURL == "" {
 		return fmt.Errorf("step 5: no sibling to inspect")
 	}
+	d.log("step 5/7: enumerate providers at %s", d.lastSiblingURL)
 
 	// If the sibling is a list of short-id objects, treat as
 	// provider list. The classifier populates ProviderList.
@@ -400,6 +437,7 @@ func (d *Discovery) stepResolveStream(ctx context.Context) error {
 	if len(d.Providers) == 0 {
 		return fmt.Errorf("step 6: no providers to probe")
 	}
+	d.log("step 6/7: resolve stream key (provider=%s)", d.Providers[0].Name)
 
 	// For each provider, fetch the sources endpoint and try to
 	// resolve a stream URL. Stop at the first HLS provider; for
@@ -495,6 +533,7 @@ func (d *Discovery) stepClassifyPlaylist(ctx context.Context) error {
 	if d.streamKey == "" {
 		return fmt.Errorf("step 7: no stream key to resolve")
 	}
+	d.log("step 7/7: classify playlist")
 
 	// Build the playlist URL from the resolved CDN.
 	var playlistURL string
@@ -544,13 +583,22 @@ func (d *Discovery) stepClassifyPlaylist(ctx context.Context) error {
 
 // probe does an HTTP GET with the auth headers for the URL's host
 // and records the request/response in the auth store on 403.
+// When verbose is set, every probe emits a one-line summary
+// ("GET <url> -> 200, 17 KB") so the caller can see what the
+// chain engine is doing in real time.
 func (d *Discovery) probe(ctx context.Context, rawURL, note string) (*probe.Response, error) {
 	host := auth.HostOf(rawURL)
 	headers := d.Auth.HeadersFor(host)
+	if d.verbose {
+		d.log("→ %s (%s)", rawURL, note)
+	}
 	resp, err := probe.Do(ctx, probe.Request{URL: rawURL, Headers: headers})
 	if err != nil {
 		d.log("probe %s: error %v", note, err)
 		return nil, err
+	}
+	if d.verbose {
+		d.log("← %d %s, %s", resp.Status, httpStatusText(resp.Status), humanBytesShort(int64(len(resp.Body))))
 	}
 	// 403 with forbidden origin → record page host as Origin/Referer.
 	if resp.Status == 403 {
@@ -566,9 +614,64 @@ func (d *Discovery) probe(ctx context.Context, rawURL, note string) (*probe.Resp
 			if err != nil {
 				return nil, err
 			}
+			if d.verbose {
+				d.log("← %d %s (retry), %s", resp.Status, httpStatusText(resp.Status), humanBytesShort(int64(len(resp.Body))))
+			}
 		}
 	}
 	return resp, nil
+}
+
+// httpStatusText returns a short description for common status
+// codes — for the verbose log line, "200 OK" / "404 Not Found"
+// is much more useful than just "200".
+func httpStatusText(code int) string {
+	switch {
+	case code >= 200 && code < 300:
+		return "OK"
+	case code == 301:
+		return "Moved Permanently"
+	case code == 302:
+		return "Found"
+	case code == 304:
+		return "Not Modified"
+	case code == 400:
+		return "Bad Request"
+	case code == 401:
+		return "Unauthorized"
+	case code == 403:
+		return "Forbidden"
+	case code == 404:
+		return "Not Found"
+	case code == 405:
+		return "Method Not Allowed"
+	case code == 429:
+		return "Too Many Requests"
+	case code >= 500 && code < 600:
+		return "Server Error"
+	}
+	return ""
+}
+
+// humanBytesShort is a compact byte-count for the verbose log
+// line — "1.2 MiB" / "847 KB" / "0 B" / "3.4 GiB".
+func humanBytesShort(n int64) string {
+	const (
+		KiB = 1024
+		MiB = 1024 * 1024
+		GiB = 1024 * 1024 * 1024
+	)
+	switch {
+	case n >= GiB:
+		return fmt.Sprintf("%.1f GiB", float64(n)/GiB)
+	case n >= MiB:
+		return fmt.Sprintf("%.1f MiB", float64(n)/MiB)
+	case n >= KiB:
+		return fmt.Sprintf("%.1f KiB", float64(n)/KiB)
+	case n == 0:
+		return "0 B"
+	}
+	return fmt.Sprintf("%d B", n)
 }
 
 // probeWithAuth is an alias for probe — kept distinct for the
@@ -628,7 +731,11 @@ func (d *Discovery) recordStep(url, method string, shape classify.Shape, outcome
 }
 
 func (d *Discovery) log(format string, args ...any) {
-	d.Logs = append(d.Logs, fmt.Sprintf(format, args...))
+	line := fmt.Sprintf(format, args...)
+	d.Logs = append(d.Logs, line)
+	if d.stream != nil {
+		fmt.Fprintln(d.stream, line)
+	}
 }
 
 // --- pure helpers (also used by strategies.go) ---

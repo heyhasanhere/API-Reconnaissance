@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -52,6 +53,7 @@ type globalFlags struct {
 	ver      bool
 	noColor  bool
 	dryRun   bool
+	verbose  bool
 	episodes string
 	provider string
 	output   string
@@ -79,6 +81,7 @@ func run(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 	fs.BoolVar(&gf.ver, "v", false, "print version")
 	fs.BoolVar(&gf.noColor, "no-color", false, "disable color output")
 	fs.BoolVar(&gf.dryRun, "dry-run", false, "discover and resolve the stream, but don't download")
+	fs.BoolVar(&gf.verbose, "verbose", false, "stream probe decisions to stderr (every GET, every result)")
 	fs.StringVar(&gf.episodes, "episodes", "", "episode range (e.g. '1,3-5'); skips the prompt")
 	fs.StringVar(&gf.provider, "provider", "", "provider name; skips the prompt")
 	fs.StringVar(&gf.output, "output", "", "output directory for downloaded files")
@@ -134,9 +137,29 @@ func run(args []string, stdout, stderr io.Writer, stdin io.Reader) int {
 func runDiscover(ctx context.Context, entryURL string, gf globalFlags, stdout, stderr io.Writer, stdin io.Reader) int {
 	fmt.Fprintf(stdout, "Resolving %s\n", entryURL)
 
-	// Phase 1: chain.
-	d, err := chain.Run(ctx, entryURL)
+	// Phase 1: chain. Pass --verbose streaming to a buffered
+	// stderr so the user sees probe decisions in real time.
+	var logWriter io.Writer
+	if gf.verbose {
+		// bufio.Writer coalesces per-line writes; the chain
+		// engine flushes nothing itself, so we Flush at the
+		// end of runDiscover (and on error).
+		bw := bufio.NewWriter(stderr)
+		logWriter = bw
+		defer bw.Flush()
+		fmt.Fprintln(stderr, "  ↳ verbose: streaming probe decisions to stderr")
+	}
+	opts := &chain.RunOptions{
+		Verbose: gf.verbose,
+		Stream:  logWriter,
+	}
+	d, err := chain.Run(ctx, entryURL, opts)
 	if err != nil {
+		// Flush the verbose stream before the failure block so
+		// any in-flight log lines are visible.
+		if bw, ok := logWriter.(*bufio.Writer); ok {
+			bw.Flush()
+		}
 		fmt.Fprintf(stderr, "discovery failed: %v\n", err)
 		fmt.Fprintln(stderr, "last steps:")
 		for _, s := range d.Steps {

@@ -1,10 +1,12 @@
 package chain
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/heyhasanhere/API-Reconnaissance/pkg/auth"
@@ -427,6 +429,38 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestRunOptions_Stream: with Verbose+Stream set, every log line
+// is also written to the streaming writer. We don't make any
+// network calls — we just check that the stream is wired and
+// d.log() routes through to it.
+func TestRunOptions_Stream(t *testing.T) {
+	var buf bytes.Buffer
+	d := &Discovery{
+		EntryURL: "https://example.com/x",
+		Auth:     auth.New(),
+		verbose:  true,
+		stream:   &buf,
+	}
+	d.log("test line %d", 42)
+	if !strings.Contains(buf.String(), "test line 42") {
+		t.Errorf("stream did not receive log line; got %q", buf.String())
+	}
+	// d.Logs is still populated for the final summary.
+	if len(d.Logs) == 0 || d.Logs[len(d.Logs)-1] != "test line 42" {
+		t.Errorf("d.Logs not populated; got %v", d.Logs)
+	}
+}
+
+// TestRunOptions_StreamNil: with Stream=nil, d.log() still
+// populates d.Logs but doesn't panic.
+func TestRunOptions_StreamNil(t *testing.T) {
+	d := &Discovery{EntryURL: "https://example.com/x", Auth: auth.New(), verbose: true}
+	d.log("only in logs")
+	if len(d.Logs) != 1 || d.Logs[0] != "only in logs" {
+		t.Errorf("d.Logs = %v, want [only in logs]", d.Logs)
+	}
 }
 
 // compile-time checks
