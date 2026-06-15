@@ -63,6 +63,34 @@ var scriptOrModuleRE = regexp.MustCompile(
 // downgraded by the browser anyway).
 var httpsURLRE = regexp.MustCompile(`https://([a-zA-Z0-9.\-]+)`)
 
+// fetchURLRE matches https://host/path literals that appear as
+// the URL argument to a fetch() call, e.g. fetch("https://x.com/y")
+// or fetch(`https://x.com/${id}`). The window is small — up to
+// 80 chars before the URL — to avoid matching fetch() calls in
+// comments. fetchBaseURL is the first capture (host), used by
+// extractHostsFromBundle to distinguish API bases (hosts that
+// appear as fetch() targets) from stream-CDN hosts (hosts that
+// appear in HOST_HANDLERS string templates).
+var fetchURLRE = regexp.MustCompile(`fetch\(\s*["'\x60]https://([a-zA-Z0-9.\-]+)`)
+
+// urlWithPathRE matches https://host/path[...] literals — the
+// path must start with `/[a-zA-Z0-9_-]` so we can distinguish
+// a URL-with-path from a bare-host literal. This catches the
+// common "const e=`https://host/...`,r=await fetch(e,...)"
+// pattern where the URL is assigned to a variable before
+// fetch() is called. Bare-host literals (no path) are CDN
+// bases like `const P="https://crs.24stream.xyz"`. The
+// capture group is the full `https://host/...rest` so we can
+// inspect the path component.
+var urlWithPathRE = regexp.MustCompile(`https://([a-zA-Z0-9.\-]+)/[a-zA-Z0-9_\-][^"')\s\x60]*`)
+
+// streamCDNPathRE matches paths that indicate a stream-CDN
+// endpoint rather than an API endpoint. These are excluded
+// from the "strong API candidate" set even if the host
+// appears with a path — they're URL rewrite targets in
+// HOST_HANDLERS maps, not fetch() bases.
+var streamCDNPathRE = regexp.MustCompile(`^/(media|stream|storage|cdn-cgi|assets|static|img|images|fonts)/`)
+
 // BundleScan returns the hostnames referenced by https://...
 // literals in the entry page's JS bundles, deduplicated and
 // lowercased. The list is unordered; DecideCandidateBases()
@@ -148,10 +176,55 @@ func extractScriptSrcs(html []byte, pageURL string) []string {
 // the order they first appear. Junk hostnames (empty, no dot,
 // IP addresses, hostnames that are actually paths) are filtered
 // out.
+//
+// We also distinguish API-base hosts from stream-CDN hosts:
+//   - An API-base is a host that appears as the URL argument
+//     to a fetch() call, OR appears with a path that's not a
+//     known stream-CDN path (/media/, /stream/, /storage/, ...).
+//     The fetch() pattern catches fetch("https://x/...") and
+//     fetch(`https://x/...`). The path pattern catches the
+//     common `const e=\`https://x/...\`,r=await fetch(e,...)`
+//     indirection where the URL is assigned to a variable
+//     before being fetched.
+//   - A stream-CDN host appears only with bare-host literals
+//     (e.g. const P="https://crs.24stream.xyz") or with paths
+//     like /media/, /stream/, /storage/. These are the rewrite
+//     targets in HOST_HANDLERS maps, never fetched directly.
+//
+// The first group is returned first; the second group follows.
 func extractHostsFromBundle(bundle []byte) []string {
+	text := string(bundle)
+
+	// Set of hosts seen with API-likely context (fetch() arg,
+	// or with a non-CDN path).
+	apiSet := map[string]bool{}
+	for _, m := range fetchURLRE.FindAllStringSubmatch(text, -1) {
+		h := strings.ToLower(m[1])
+		if isPlausibleHost(h) {
+			apiSet[h] = true
+		}
+	}
+	for _, m := range urlWithPathRE.FindAllStringSubmatch(text, -1) {
+		h := strings.ToLower(m[1])
+		// path is m[0] minus the host+"/" prefix. The
+		// urlWithPathRE already guarantees a path starts
+		// with "/" + [a-zA-Z0-9_-]. The stream-CDN filter
+		// removes /media/, /stream/, /storage/, etc.
+		rest := m[0][len("https://")+len(h):]
+		if streamCDNPathRE.MatchString(rest) {
+			continue
+		}
+		if isPlausibleHost(h) {
+			apiSet[h] = true
+		}
+	}
+
+	// Second pass: all https:// host literals, in order, but
+	// tagged with whether they were seen as a fetch() target
+	// or with an API-likely path.
 	seen := map[string]bool{}
-	var out []string
-	for _, m := range httpsURLRE.FindAllStringSubmatch(string(bundle), -1) {
+	var api, cdn []string
+	for _, m := range httpsURLRE.FindAllStringSubmatch(text, -1) {
 		h := strings.ToLower(m[1])
 		if !isPlausibleHost(h) {
 			continue
@@ -160,9 +233,13 @@ func extractHostsFromBundle(bundle []byte) []string {
 			continue
 		}
 		seen[h] = true
-		out = append(out, h)
+		if apiSet[h] {
+			api = append(api, h)
+		} else {
+			cdn = append(cdn, h)
+		}
 	}
-	return out
+	return append(api, cdn...)
 }
 
 // isPlausibleHost filters out regex false positives: empty

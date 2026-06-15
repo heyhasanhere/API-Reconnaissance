@@ -56,7 +56,8 @@ func TestExtractScriptSrcs_NoScripts(t *testing.T) {
 }
 
 // TestExtractHostsFromBundle: given a JS bundle string, returns
-// the deduplicated set of hostnames from all https:// literals.
+// the deduplicated set of hostnames from all https:// literals,
+// with hosts that appear as fetch() targets ranked first.
 func TestExtractHostsFromBundle(t *testing.T) {
 	bundle := []byte(`
 		const c="https://api.example.com";
@@ -70,10 +71,13 @@ func TestExtractHostsFromBundle(t *testing.T) {
 		const empty = "https://";
 	`)
 	got := extractHostsFromBundle(bundle)
+	// chad.example.com is a fetch() target → first.
+	// api.example.com / crs.24stream.xyz / cdn.example.com appear
+	// only in string templates → follow in document order.
 	want := []string{
+		"chad.example.com",
 		"api.example.com",
 		"crs.24stream.xyz",
-		"chad.example.com",
 		"cdn.example.com",
 	}
 	if !equalStrings(got, want) {
@@ -84,14 +88,19 @@ func TestExtractHostsFromBundle(t *testing.T) {
 // TestExtractHostsFromBundle_RealAnidapBundle: verify the
 // scanner produces the right hosts for the captured anidap
 // api-*.js bundle. The expected hosts are chad.anidap.se
-// (the real backend), api.anidap.se (a placeholder that doesn't
-// resolve), and the proxy/CDN hosts.
+// (the real backend, appears 3× as a fetch() target — first),
+// plus the stream-CDN hosts from HOST_HANDLERS (string-template
+// targets — after). chad must be ranked first so step 2 finds
+// the right base quickly.
 func TestExtractHostsFromBundle_RealAnidapBundle(t *testing.T) {
 	bundle, err := os.ReadFile("../../testdata/anidap_api_bundle.js")
 	if err != nil {
 		t.Skipf("fixture not present: %v", err)
 	}
 	hosts := extractHostsFromBundle(bundle)
+	if len(hosts) == 0 {
+		t.Fatal("no hosts extracted from real anidap bundle")
+	}
 	have := map[string]bool{}
 	for _, h := range hosts {
 		have[h] = true
@@ -102,6 +111,29 @@ func TestExtractHostsFromBundle_RealAnidapBundle(t *testing.T) {
 	} {
 		if !have[want] {
 			t.Errorf("expected host %q not found in bundle scan; got %v", want, hosts)
+		}
+	}
+	// chad.anidap.se must come first (it's the only fetch()
+	// target in the bundle).
+	if hosts[0] != "chad.anidap.se" {
+		t.Errorf("hosts[0] = %q, want chad.anidap.se (the only fetch() target); got %v", hosts[0], hosts)
+	}
+	// The known stream-CDN hosts should NOT be the first entry.
+	for _, cdn := range []string{
+		"crs.24stream.xyz", "hls.anidb.app", "megaplay.buzz",
+		"kwik.cx", "ply.24stream.xyz", "mp4.24stream.xyz",
+		"wave.24stream.xyz", "tools.fast4speed.rsvp",
+	} {
+		if have[cdn] {
+			// find the index; it must be > 0
+			for i, h := range hosts {
+				if h == cdn {
+					if i == 0 {
+						t.Errorf("stream-CDN host %q ranked first in %v (should be after fetch targets)", cdn, hosts)
+					}
+					break
+				}
+			}
 		}
 	}
 }
