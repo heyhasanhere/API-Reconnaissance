@@ -257,6 +257,169 @@ func TestDecideCDNHost(t *testing.T) {
 	}
 }
 
+// TestStepResolveEntry_BundleScan: the entry URL is an HTML page
+// with a modulepreload link to a JS bundle. The bundle hardcodes
+// https://api.example.com and https://chad.example.com. After
+// stepResolveEntry, d.CandidateBases should contain both, with
+// the chad one ranked first (api. and chad. are equal-priority,
+// order is by document order in the bundle).
+func TestStepResolveEntry_BundleScan(t *testing.T) {
+	const bundleJS = `const a="https://api.example.com";` +
+		`const b="https://chad.example.com";` +
+		`const c="https://cdn.example.com";`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/anime/x":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!doctype html><html><head>
+				<link rel="modulepreload" href="/assets/api.js">
+			</head><body>hi</body></html>`))
+		case "/assets/api.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(bundleJS))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	d := &Discovery{EntryURL: srv.URL + "/anime/x", Auth: auth.New()}
+	if err := d.stepResolveEntry(context.Background()); err != nil {
+		t.Fatalf("stepResolveEntry: %v", err)
+	}
+	// API-likely hosts (api., chad.) should be first, cdn. last.
+	if len(d.CandidateBases) != 3 {
+		t.Fatalf("CandidateBases = %v, want 3 hosts", d.CandidateBases)
+	}
+	// First two are api./chad. in some order, last is cdn.
+	if d.CandidateBases[2] != "cdn.example.com" {
+		t.Errorf("CandidateBases[2] = %q, want cdn.example.com (deprioritized)", d.CandidateBases[2])
+	}
+	// APIBase should be set to the first candidate.
+	if d.APIBase != "https://"+d.CandidateBases[0] {
+		t.Errorf("APIBase = %q, want https://%s", d.APIBase, d.CandidateBases[0])
+	}
+}
+
+// TestStepDetectListEndpoint_CrossHost: pure-logic test that the
+// chain engine iterates the candidate bases produced by the
+// bundle scan. We don't make real network calls — the actual
+// probe is exercised by the bundle-scan integration test below.
+// Here we just verify that candidateAPIBases() expands
+// CandidateBases in priority order.
+func TestStepDetectListEndpoint_CrossHost(t *testing.T) {
+	d := &Discovery{
+		APIBase:        "https://entry.example.com/api", // fallback
+		CandidateBases: []string{"chad.example.com", "api.example.com"},
+		Auth:           auth.New(),
+	}
+	got := d.candidateAPIBases()
+	want := []string{
+		"https://chad.example.com",
+		"https://api.example.com",
+		"https://entry.example.com/api", // fallback, not duplicated
+	}
+	if !equalStrings(got, want) {
+		t.Errorf("candidateAPIBases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestStepDetectListEndpoint_CrossHost_DeduplicatesFirst: when
+// APIBase matches the first candidate (which it normally does,
+// because step 1 sets APIBase to the first candidate), the
+// fallback isn't duplicated.
+func TestStepDetectListEndpoint_CrossHost_DeduplicatesFirst(t *testing.T) {
+	d := &Discovery{
+		APIBase:        "https://chad.example.com", // same as first candidate
+		CandidateBases: []string{"chad.example.com", "api.example.com"},
+		Auth:           auth.New(),
+	}
+	got := d.candidateAPIBases()
+	want := []string{
+		"https://chad.example.com",
+		"https://api.example.com",
+	}
+	if !equalStrings(got, want) {
+		t.Errorf("candidateAPIBases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestStepDetectListEndpoint_CrossHost_NoCandidates: backward
+// compat — when CandidateBases is empty, only APIBase is tried.
+func TestStepDetectListEndpoint_CrossHost_NoCandidates(t *testing.T) {
+	d := &Discovery{
+		APIBase: "https://entry.example.com/api",
+		Auth:    auth.New(),
+	}
+	got := d.candidateAPIBases()
+	want := []string{"https://entry.example.com/api"}
+	if !equalStrings(got, want) {
+		t.Errorf("candidateAPIBases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestDecideCandidateBases: pure function ranking. Backend-
+// prefixed hosts (api./chad./v[0-9].) on the entry apex are
+// kept; other entry-apex hosts (cdn./random.) are filtered as
+// they're usually the same site's UI/CDN infrastructure.
+func TestDecideCandidateBases(t *testing.T) {
+	hosts := []string{
+		"cdn.example.com",     // on entry apex, not backend — filtered
+		"chad.example.com",    // on entry apex, backend prefix — kept
+		"api.example.com",     // on entry apex, backend prefix — kept
+		"random.example.com",  // on entry apex, not backend — filtered
+		"example.com",         // entry host — filtered
+		"v2.api.com",          // on entry apex, version prefix — kept
+		"react.dev",           // framework host — filtered
+		"api.somethingelse.io", // different apex — kept
+	}
+	got := DecideCandidateBases("https://example.com/x", hosts)
+	// API-likely: chad, api, v2.api.com. Cross-apex: api.somethingelse.io.
+	want := []string{
+		"chad.example.com",
+		"api.example.com",
+		"v2.api.com",
+		"api.somethingelse.io",
+	}
+	if !equalStrings(got, want) {
+		t.Errorf("DecideCandidateBases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestDecideCandidateBases_BlocksApex: when scanning for anidap's
+// backend, both anidap.se and its apex (e.g. www.anidap.se) are
+// filtered. The bundle scanner finds chad.anidap.se, anidap.se is
+// the entry host.
+func TestDecideCandidateBases_BlocksApex(t *testing.T) {
+	hosts := []string{
+		"anidap.se",
+		"www.anidap.se",
+		"chad.anidap.se",
+	}
+	got := DecideCandidateBases("https://anidap.se/watch", hosts)
+	want := []string{"chad.anidap.se"}
+	if !equalStrings(got, want) {
+		t.Errorf("DecideCandidateBases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// TestIsFrameworkHost: the blocklist catches the common vendor
+// hosts found in modern SPA bundles.
+func TestIsFrameworkHost(t *testing.T) {
+	yes := []string{"react.dev", "reactrouter.com", "unpkg.com", "esm.sh", "chiaki.site", "i.ytimg.com"}
+	for _, h := range yes {
+		if !isFrameworkHost(h) {
+			t.Errorf("isFrameworkHost(%q) = false, want true", h)
+		}
+	}
+	no := []string{"api.example.com", "chad.example.com", "example.com", "v1.api.com"}
+	for _, h := range no {
+		if isFrameworkHost(h) {
+			t.Errorf("isFrameworkHost(%q) = true, want false", h)
+		}
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

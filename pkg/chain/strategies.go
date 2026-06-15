@@ -116,6 +116,160 @@ func DecideOnError(shape classify.Shape) Signal {
 	}
 }
 
+// DecideCandidateBases ranks hosts discovered by the page-bundle
+// scan. It filters out:
+//   - the entry host (we already tried it)
+//   - the entry host's parent domain (e.g. anidap.se when
+//     scanning for anidap's backend — the page already has a /api
+//     path that we tried)
+//   - well-known framework/UI/library hosts that show up as
+//     literals in vendor bundles (react.dev, reactrouter.com,
+//     jsdelivr.net, esm.sh, etc.) — these aren't API bases, they're
+//     documentation pages or CDN endpoints.
+//
+// The rest are bucketed by subdomain prefix and returned in
+// priority order: API-likely first (api./chad./rest./v[0-9].),
+// then unknown, then CDN-likely (cdn./media./i./img./assets.).
+// Order within a bucket is the input order (i.e. document order
+// in the bundle).
+func DecideCandidateBases(entryURL string, hosts []string) []string {
+	entryHost := hostOf(entryURL)
+	seen := map[string]bool{entryHost: true}
+	apex := apexDomain(entryHost)
+	hasBackendPrefix := func(h string) bool {
+		// Hosts that look like a backend subdomain on the entry
+		// apex are NOT blocked. E.g. anidap.se's real backend is
+		// chad.anidap.se — same apex, but the chad. prefix is a
+		// tell that it's a separate service.
+		return strings.HasPrefix(h, "api.") ||
+			strings.HasPrefix(h, "chad.") ||
+			strings.HasPrefix(h, "rest.") ||
+			strings.HasPrefix(h, "backend.") ||
+			isVersionPrefix(h)
+	}
+
+	var apiLike, unknown, cdnLike []string
+	for _, h := range hosts {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" || seen[h] {
+			continue
+		}
+		// Block hosts on the entry apex UNLESS they look like a
+		// backend subdomain. The page's own /api/... paths are
+		// tried in step 1's HTML fallback — same-apex hosts
+		// (www.x.com, cdn.x.com, etc.) are usually UI/CDN
+		// infrastructure, not separate APIs.
+		if apex != "" && (h == apex || strings.HasSuffix(h, "."+apex)) {
+			if hasBackendPrefix(h) {
+				// Backend prefix on the entry apex — keep it.
+			} else {
+				seen[h] = true
+				continue
+			}
+		}
+		seen[h] = true
+		if isFrameworkHost(h) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(h, "api."),
+			strings.HasPrefix(h, "chad."),
+			strings.HasPrefix(h, "rest."),
+			isVersionPrefix(h):
+			apiLike = append(apiLike, h)
+		case strings.HasPrefix(h, "cdn."),
+			strings.HasPrefix(h, "media."),
+			strings.HasPrefix(h, "i."),
+			strings.HasPrefix(h, "img."),
+			strings.HasPrefix(h, "assets."):
+			cdnLike = append(cdnLike, h)
+		default:
+			unknown = append(unknown, h)
+		}
+	}
+	return append(append(apiLike, unknown...), cdnLike...)
+}
+
+// isFrameworkHost returns true for known framework/UI/library
+// hostnames that show up as literals in vendor bundles. These
+// are not API bases — they're documentation pages, package CDNs,
+// or analytics. The list is intentionally small and curated:
+// real sites use these vendors, so we should not probe them as
+// if they were the site's own API.
+func isFrameworkHost(h string) bool {
+	switch h {
+	// React ecosystem.
+	case "react.dev", "reactrouter.com", "reactjs.org":
+		return true
+	// NPM/CDN.
+	case "unpkg.com", "cdn.jsdelivr.net", "cdn.skypack.dev",
+		"esm.sh", "cdnjs.cloudflare.com", "cdn.esm.sh":
+		return true
+	// Analytics / tracking.
+	case "www.googletagmanager.com", "static.cloudflareinsights.com",
+		"doctusflaxman.com", "payeddrub.com", "acscdn.com":
+		return true
+	// Image hosts (anidap uses chiaki.site, anili.st, ak.jk for
+	// cover art — not API hosts).
+	case "chiaki.site", "img.anili.st", "s4.anilist.co", "i.ytimg.com",
+		"artworks.thetvdb.com", "img.ak.jk":
+		return true
+	// Common CDN subdomains that aren't the page's API.
+	case "fonts.gstatic.com", "fonts.googleapis.com":
+		return true
+	}
+	return false
+}
+
+// isVersionPrefix returns true for hosts whose first label is a
+// version tag (v1., v2., v3., etc.).
+func isVersionPrefix(host string) bool {
+	if len(host) < 4 || host[0] != 'v' {
+		return false
+	}
+	for i := 1; i < len(host); i++ {
+		if host[i] == '.' {
+			return i > 1 // need at least one digit
+		}
+		if host[i] < '0' || host[i] > '9' {
+			return false
+		}
+	}
+	return false
+}
+
+// hostOf extracts the bare hostname from a URL, lowercased. Used
+// for filtering and de-duplication; returns "" if the input isn't
+// a URL with a host.
+func hostOf(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	rawURL = strings.TrimPrefix(rawURL, "https://")
+	rawURL = strings.TrimPrefix(rawURL, "http://")
+	if i := strings.IndexByte(rawURL, '/'); i >= 0 {
+		rawURL = rawURL[:i]
+	}
+	if i := strings.IndexByte(rawURL, ':'); i >= 0 {
+		rawURL = rawURL[:i]
+	}
+	return strings.ToLower(rawURL)
+}
+
+// apexDomain returns the last two labels of a hostname
+// (anidap.se → anidap.se, www.anidap.se → anidap.se,
+// sub.deep.example.com → example.com). Returns "" if the
+// hostname has fewer than 2 labels.
+func apexDomain(h string) string {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return ""
+	}
+	parts := strings.Split(h, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2] + "." + parts[len(parts)-1]
+}
+
 // asInt tries to coerce a JSON-decoded number field into an int.
 // JSON numbers come in as float64; this also handles int already
 // (in case the upstream used UseNumber).

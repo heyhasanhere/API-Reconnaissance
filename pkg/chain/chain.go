@@ -45,13 +45,14 @@ type Discovery struct {
 	Final     *FinalState
 
 	// Working state used across steps.
-	resourceURL     string // /api/.../episodes/{n} once drilled
-	listPath        string // e.g. /episodes — appended to APIBase in step 3
-	streamKey       string // the opaque `url` field from /sources
-	streamCDN       string // resolved CDN host, e.g. prox.anikage.cc
-	lastSiblingURL  string
-	lastSiblingBody []byte
-	lastSiblingSha  classify.Shape
+	resourceURL      string // /api/.../episodes/{n} once drilled
+	listPath         string // e.g. /episodes — appended to APIBase in step 3
+	streamKey        string // the opaque `url` field from /sources
+	streamCDN        string // resolved CDN host, e.g. prox.anikage.cc
+	lastSiblingURL   string
+	lastSiblingBody  []byte
+	lastSiblingSha   classify.Shape
+	CandidateBases   []string // cross-host API bases from bundle scan
 }
 
 // Step records one probe and its outcome.
@@ -146,10 +147,22 @@ func (d *Discovery) stepResolveEntry(ctx context.Context) error {
 				return nil
 			}
 		}
-		// No script hint. Try the common /api prefix.
+		// Modern SPA fallback: the page is a JS app, the API
+		// surface is documented in a modulepreload'd bundle. Scan
+		// the bundles for cross-host API base candidates.
+		bundleHosts := BundleScan(ctx, resp.Body, d.EntryURL, d.probeBody)
+		if bases := DecideCandidateBases(d.EntryURL, bundleHosts); len(bases) > 0 {
+			d.CandidateBases = bases
+			d.APIBase = "https://" + bases[0]
+			d.log("discovered %d candidate API base(s) from page bundle: %s",
+				len(bases), strings.Join(bases, ", "))
+			return nil
+		}
+		// No script hint, no bundle candidates. Try the common
+		// /api prefix as a last resort.
 		if u, err := url.Parse(d.EntryURL); err == nil {
 			d.APIBase = u.Scheme + "://" + u.Host + "/api"
-			d.log("no <script> hint, trying %s as API base", d.APIBase)
+			d.log("no <script> hint, no bundle candidates; trying %s as API base", d.APIBase)
 			return nil
 		}
 		return fmt.Errorf("could not extract API base from HTML entry")
@@ -185,24 +198,66 @@ func (d *Discovery) stepDetectListEndpoint(ctx context.Context) error {
 		return nil
 	}
 
-	// Try common list suffixes.
+	// Build the list of candidate bases. If the bundle scan
+	// produced multiple candidates, try each. The /api and
+	// /rest/api prefixes are appended per-base to cover the
+	// two common layouts (anikage = /api, anidap = /rest/api).
 	suffixes := []string{"/episodes", "/items", "/list", "/catalog", "/browse", "/videos", "/posts"}
-	for _, suf := range suffixes {
-		u := d.APIBase + suf
-		resp, err := d.probe(ctx, u, "list endpoint candidate")
-		if err != nil {
-			continue
+	bases := d.candidateAPIBases()
+	for _, base := range bases {
+		// Try the base as-is first, then with /api and /rest/api
+		// suffixed — handles the case where DecideCandidateBases
+		// returned a host without a path.
+		variants := []string{base, base + "/api", base + "/rest/api"}
+		seen := map[string]bool{}
+		for _, fullBase := range variants {
+			if seen[fullBase] {
+				continue
+			}
+			seen[fullBase] = true
+			for _, suf := range suffixes {
+				u := fullBase + suf
+				resp, err := d.probe(ctx, u, "list endpoint candidate")
+				if err != nil {
+					continue
+				}
+				shape := classify.Classify(resp, u)
+				if shape.Kind == classify.KindJSONList && shape.ItemCount > 0 {
+					d.APIBase = fullBase
+					d.recordStep(u, "GET", shape, "ok",
+						fmt.Sprintf("list endpoint on %s", fullBase))
+					d.populateEpisodesFromBody(resp.Body)
+					return nil
+				}
+				d.recordStep(u, "GET", shape, "miss", "not a list")
+			}
 		}
-		shape := classify.Classify(resp, u)
-		if shape.Kind == classify.KindJSONList && shape.ItemCount > 0 {
-			d.recordStep(u, "GET", shape, "ok", "found list endpoint")
-			d.populateEpisodesFromBody(resp.Body)
-			return nil
-		}
-		d.recordStep(u, "GET", shape, "miss", "not a list")
 	}
 
-	return fmt.Errorf("step 2: no list endpoint found under %s (tried %d suffixes)", d.APIBase, len(suffixes))
+	return fmt.Errorf("step 2: no list endpoint found (tried %d bases × %d suffixes)",
+		len(bases), len(suffixes))
+}
+
+// candidateAPIBases returns the API bases to try in step 2, in
+// priority order. If the bundle scan populated CandidateBases,
+// those come first; the current APIBase is appended as the
+// fallback so the existing single-host behavior is preserved.
+func (d *Discovery) candidateAPIBases() []string {
+	if len(d.CandidateBases) == 0 {
+		return []string{d.APIBase}
+	}
+	out := make([]string, 0, len(d.CandidateBases)+1)
+	for _, h := range d.CandidateBases {
+		out = append(out, "https://"+h)
+	}
+	if d.APIBase != "" {
+		// Avoid duplicating the first candidate.
+		first := "https://" + d.CandidateBases[0]
+		if d.APIBase != first {
+			out = append(out, d.APIBase)
+		}
+	}
+	return out
 }
 
 // --- step 3: drill into one item ---
@@ -520,6 +575,18 @@ func (d *Discovery) probe(ctx context.Context, rawURL, note string) (*probe.Resp
 // call sites that need to make the auth-injection intent clear.
 func (d *Discovery) probeWithAuth(ctx context.Context, rawURL, note string) (*probe.Response, error) {
 	return d.probe(ctx, rawURL, note)
+}
+
+// probeBody is a thin wrapper around probe that returns just the
+// response body. It's the getter BundleScan needs to fetch page
+// bundles; returning a flat []byte keeps BundleScan's signature
+// free of probe-package imports.
+func (d *Discovery) probeBody(ctx context.Context, rawURL string) ([]byte, error) {
+	resp, err := d.probe(ctx, rawURL, "page bundle")
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 // populateEpisodesFromBody parses a JSON list and fills d.Episodes.
