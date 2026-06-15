@@ -40,10 +40,23 @@ go install .
 ```
 
 The module path matches the GitHub URL, so once the repo is public
-this also works directly:
+this also works directly. The Go module proxy caches `@latest`
+based on the default branch's HEAD, so right after a rename or
+push, prefer `@main` (or a tagged version) over `@latest` —
+the proxy can take a few hours to reindex:
 
 ```bash
-go install github.com/heyhasanhere/API-Reconnaissance@latest
+go install github.com/heyhasanhere/API-Reconnaissance@main   # always current
+go install github.com/heyhasanhere/API-Reconnaissance@latest # once the proxy reindexes
+```
+
+To make `@latest` reliable immediately, push a tag and install
+the tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0
 ```
 
 ### Playwright (only if you use `watch` or `click`)
