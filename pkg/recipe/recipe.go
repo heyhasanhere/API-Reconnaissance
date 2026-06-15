@@ -1,243 +1,275 @@
-// Package recipe defines the on-disk representation of a domain's
-// API: endpoints, captured auth, sibling relationships, and the
-// download shape. Recipes are the source of truth in api-recon; the
-// REPL harvests them, `run` replays them, `verify` re-checks them.
+// Package recipe is the minimal on-disk store for discovered
+// chains. v2 doesn't need v0.1.0's strict Validate/Fill — the
+// chain engine re-derives placeholders from the recorded steps
+// at replay time, so the recipe is just a structured log of what
+// worked.
 //
-// A recipe is a JSON file at:
-//
-//	$XDG_DATA_HOME/api-recon/recipes/<domain>.json  (default)
-//	./.api-recon/recipes/<domain>.json             (project-local override)
-//
-// File mode is 0600 because recipes may contain captured tokens.
+// On-disk format: pretty-printed JSON, mode 0600, atomic write.
+// Path: <root>/<domain>.json where root defaults to
+// $XDG_DATA_HOME/api-recon/recipes/ (or
+// $HOME/.local/share/api-recon/recipes/).
 package recipe
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
-// CurrentSchemaVersion is the schema version this code emits and
-// understands. Bump when the on-disk format changes incompatibly.
+// CurrentSchemaVersion is stamped into new recipes.
 const CurrentSchemaVersion = 1
 
-// Recipe is the top-level type. A Recipe is keyed by domain (e.g.
-// "anikage.cc"). Endpoints are named (e.g. "episodes", "sources",
-// "downloads") and may contain {placeholders} in their URL that
-// Fill substitutes at run time.
+// Step is one URL in the discovered chain. URLTemplate is the
+// path (or full URL) with placeholders in {braces}. Method is
+// almost always GET. Placeholders is the list of names in
+// alphabetical order, used to fill from positional args at
+// replay time.
+type Step struct {
+	Name           string   `json:"name"`
+	URLTemplate    string   `json:"url_template"`
+	Method         string   `json:"method"`
+	Placeholders   []string `json:"placeholders,omitempty"`
+	RequiredParams []string `json:"required_params,omitempty"`
+}
+
+// Provider is one streaming provider discovered via /servers.
+// IsHLS is set if the sources endpoint returns isM3U8:true for
+// this provider.
+type Provider struct {
+	Name    string `json:"name"`
+	IsHLS   bool   `json:"is_hls,omitempty"`
+	IsEmbed bool   `json:"is_embed,omitempty"`
+	Note    string `json:"note,omitempty"`
+}
+
+// Recipe is the on-disk artifact. The chain engine builds one of
+// these as it discovers, and saves it to disk on success.
 type Recipe struct {
-	SchemaVersion int                    `json:"schema_version"`
-	Domain        string                 `json:"domain"`
-	Discovered    time.Time              `json:"discovered"`
-	Updated       time.Time              `json:"updated"`
-	Notes         string                 `json:"notes,omitempty"`
-	Endpoints     map[string]Endpoint    `json:"endpoints"`
-	Siblings      map[string]Sibling     `json:"siblings,omitempty"`
-	Auth          Auth                   `json:"auth"`
-	CDN           *CDN                   `json:"cdn,omitempty"`
-	Download      *Download              `json:"download,omitempty"`
-	Failures      []Failure              `json:"failures,omitempty"`
+	SchemaVersion  int               `json:"schema_version"`
+	Domain         string            `json:"domain"`
+	Discovered     time.Time         `json:"discovered"`
+	Updated        time.Time         `json:"updated"`
+	Chain          []Step            `json:"chain"`
+	Providers      []Provider        `json:"providers,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	StreamTemplate string            `json:"stream_template,omitempty"`
+	Note           string            `json:"note,omitempty"`
 }
 
-// Endpoint is a single API endpoint. URL may contain {placeholders}
-// like {slug} or {n}; use Fill to substitute them at call time.
-type Endpoint struct {
-	URL    string   `json:"url"`
-	Method string   `json:"method"`
-	Params []string `json:"params,omitempty"`
-	Shape  string   `json:"shape"`
-	Notes  string   `json:"notes,omitempty"`
+// Store is the file-based recipe store. Construct with NewStore or
+// NewStoreAt.
+type Store struct {
+	root string
+	mu   sync.Mutex
 }
 
-// Sibling is a related endpoint that we know about. Used to record
-// failed/working alternatives the user discovered.
-type Sibling struct {
-	Path   string `json:"path"`
-	Status string `json:"status"` // "ok" | "broken" | "unknown"
-	Since  string `json:"since,omitempty"`
-	Note   string `json:"note,omitempty"`
-}
-
-// Auth is the captured authentication state. RequiredHeaders holds
-// non-auth headers like Origin/Referer that the target insists on.
-// The bearer token, session cookie, and API key are stored as
-// separate fields so they can be redacted differently on display.
-type Auth struct {
-	RequiredHeaders map[string]string `json:"required_headers,omitempty"`
-	BearerToken     string            `json:"bearer_token,omitempty"`
-	SessionCookie   string            `json:"session_cookie,omitempty"`
-	APIKey          string            `json:"api_key,omitempty"`
-	RefreshFrom     string            `json:"refresh_from,omitempty"` // endpoint name
-}
-
-// CDN describes a cross-host content delivery network. The download
-// interpreter uses this to know when to apply the parent's auth
-// headers to a different host.
-type CDN struct {
-	Host         string `json:"host"`
-	InheritsAuth bool   `json:"inherits_auth"`
-}
-
-// Download describes how to download a recognized source. Shape is
-// the recognized kind ("hls", "dash", "direct", "segment_list",
-// "html"); Tool is the binary to invoke; Flags are pre-baked.
-type Download struct {
-	Shape string   `json:"shape"`
-	Tool  string   `json:"tool"`
-	Flags []string `json:"flags,omitempty"`
-	Note  string   `json:"note,omitempty"`
-}
-
-// Failure records an endpoint that returned a non-2xx during
-// discovery. Used by `verify` to report "still broken" and to keep
-// negative knowledge from being lost.
-type Failure struct {
-	Endpoint string    `json:"endpoint"`
-	Status   int       `json:"status"`
-	Message  string    `json:"message,omitempty"`
-	When     time.Time `json:"when"`
-}
-
-// New returns a Recipe with SchemaVersion stamped, Discovered and
-// Updated set to now, and the Endpoints map initialized.
-func New(domain string) *Recipe {
-	now := time.Now().UTC()
-	return &Recipe{
-		SchemaVersion: CurrentSchemaVersion,
-		Domain:        domain,
-		Discovered:    now,
-		Updated:       now,
-		Endpoints:     map[string]Endpoint{},
+// NewStore returns a Store at the default XDG location, with the
+// directory created (mode 0700) if it doesn't exist.
+func NewStore() (*Store, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("recipe: home dir: %w", err)
 	}
+	var root string
+	if xdh := os.Getenv("XDG_DATA_HOME"); xdh != "" {
+		root = filepath.Join(xdh, "api-recon", "recipes")
+	} else {
+		root = filepath.Join(home, ".local", "share", "api-recon", "recipes")
+	}
+	return NewStoreAt(root)
 }
 
-// Validate checks the recipe for obvious problems. It is called by
-// store.Lookup before returning a loaded recipe and by `verify`
-// before re-running.
-func (r *Recipe) Validate() error {
+// NewStoreAt returns a Store at the given root directory.
+func NewStoreAt(root string) (*Store, error) {
+	if root == "" {
+		return nil, errors.New("recipe: empty root")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return nil, fmt.Errorf("recipe: mkdir %s: %w", root, err)
+	}
+	return &Store{root: root}, nil
+}
+
+// Root returns the on-disk root directory.
+func (s *Store) Root() string { return s.root }
+
+// Path returns the on-disk path for domain without checking
+// existence.
+func (s *Store) Path(domain string) string {
+	return filepath.Join(s.root, domain+".json")
+}
+
+// Save writes r to disk atomically. The file gets mode 0600.
+// SchemaVersion is stamped if zero. Discovered is preserved across
+// updates.
+func (s *Store) Save(r *Recipe) error {
 	if r == nil {
-		return errors.New("recipe is nil")
-	}
-	if r.SchemaVersion == 0 {
-		return errors.New("recipe: schema_version is 0 (missing)")
-	}
-	if r.SchemaVersion > CurrentSchemaVersion {
-		return fmt.Errorf("recipe: schema_version %d is newer than supported (%d)", r.SchemaVersion, CurrentSchemaVersion)
+		return errors.New("recipe: nil recipe")
 	}
 	if r.Domain == "" {
-		return errors.New("recipe: domain is empty")
+		return errors.New("recipe: empty domain")
 	}
-	if r.Endpoints == nil {
-		return errors.New("recipe: endpoints map is nil")
+	if !validDomain(r.Domain) {
+		return fmt.Errorf("recipe: invalid domain %q", r.Domain)
 	}
-	for name, ep := range r.Endpoints {
-		if ep.URL == "" {
-			return fmt.Errorf("recipe: endpoint %q has empty URL", name)
-		}
-		if ep.Method == "" {
-			return fmt.Errorf("recipe: endpoint %q has empty method", name)
-		}
-		if _, err := url.Parse(ep.URL); err != nil {
-			return fmt.Errorf("recipe: endpoint %q URL does not parse: %w", name, err)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if r.SchemaVersion == 0 {
+		r.SchemaVersion = CurrentSchemaVersion
+	}
+
+	final := s.Path(r.Domain)
+	if existing, err := loadFile(final); err == nil && !existing.Discovered.IsZero() {
+		r.Discovered = existing.Discovered
+	} else {
+		if r.Discovered.IsZero() {
+			r.Discovered = time.Now()
 		}
 	}
-	return nil
+	r.Updated = time.Now()
+
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("recipe: marshal: %w", err)
+	}
+	return atomicWrite(final, data)
 }
 
-// placeholderRE matches a {name} placeholder inside a URL. Names are
-// restricted to [a-zA-Z0-9_]+ for forward-compat (so we can later
-// support {name:type} or {name?default} without breaking old recipes).
-var placeholderRE = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
-
-// Placeholders returns the set of {name} placeholders present in the
-// endpoint URL, in the order they first appear.
-func (e *Endpoint) Placeholders() []string {
-	matches := placeholderRE.FindAllStringSubmatch(e.URL, -1)
-	if len(matches) == 0 {
-		return nil
+// Load reads and parses a recipe for domain. Returns
+// os.ErrNotExist if no recipe is stored.
+func (s *Store) Load(domain string) (*Recipe, error) {
+	if !validDomain(domain) {
+		return nil, fmt.Errorf("recipe: invalid domain %q", domain)
 	}
-	seen := map[string]bool{}
-	out := make([]string, 0, len(matches))
-	for _, m := range matches {
-		name := m[1]
-		if !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	return out
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return loadFile(s.Path(domain))
 }
 
-// Fill substitutes {placeholders} in the endpoint URL with values
-// from parts. It is STRICT: returns an error if any placeholder in
-// the URL is missing from parts, or if any key in parts is not a
-// placeholder in the URL.
-//
-// The returned URL has been url.QueryEscape'd per-value (not
-// per-URL) — so a value of "a b/c" becomes "a+b%2Fc", which is the
-// correct behavior for path segments. If you need to put a value
-// into the query string, encode it before calling Fill.
-func (e *Endpoint) Fill(parts map[string]string) (string, error) {
-	want := e.Placeholders()
-	have := map[string]bool{}
-	for _, p := range want {
-		_, ok := parts[p]
-		if !ok {
-			return "", fmt.Errorf("endpoint %q: missing placeholder {%s}", e.URL, p)
+// List returns all known domains, sorted.
+func (s *Store) List() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
 		}
-		have[p] = true
+		return nil, fmt.Errorf("recipe: list: %w", err)
 	}
-	for k := range parts {
-		if !have[k] {
-			return "", fmt.Errorf("endpoint %q: unknown placeholder {%s} in parts", e.URL, k)
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		domain := strings.TrimSuffix(e.Name(), ".json")
+		if validDomain(domain) {
+			out = append(out, domain)
 		}
 	}
+	sort.Strings(out)
+	return out, nil
+}
 
-	// Substitute. We use ReplaceAllStringFunc to avoid double-substitution
-	// (the value itself won't contain braces if the caller passed clean
-	// input; if it does, that's their problem). Since we already
-	// validated above that all placeholders are present, this branch
-	// only fires if the caller mutates parts concurrently — be safe
-	// anyway.
-	var missing []string
-	out := placeholderRE.ReplaceAllStringFunc(e.URL, func(match string) string {
-		name := match[1 : len(match)-1]
-		v, ok := parts[name]
+// FillTemplate substitutes {placeholder} tokens in template with
+// values from the map. Returns an error if a placeholder is
+// missing or if any key in values is not a placeholder. The
+// replacement preserves URL safety — values are inserted
+// literally without escaping (callers should not include
+// untrusted data in the values).
+func FillTemplate(template string, values map[string]string) (string, error) {
+	var firstErr error
+	out := placeholderRE.ReplaceAllStringFunc(template, func(token string) string {
+		name := strings.Trim(token, "{}")
+		v, ok := values[name]
 		if !ok {
-			missing = append(missing, name)
-			return match
+			if firstErr == nil {
+				firstErr = fmt.Errorf("missing placeholder %q", name)
+			}
+			return token
 		}
-		return url.PathEscape(v)
+		return v
 	})
-	if len(missing) > 0 {
-		return "", fmt.Errorf("endpoint %q: missing placeholders: %s", e.URL, strings.Join(missing, ", "))
+	if firstErr != nil {
+		return "", firstErr
+	}
+	// Check for unknown placeholders (keys in values that didn't
+	// appear in the template).
+	for k := range values {
+		if !strings.Contains(template, "{"+k+"}") {
+			return "", fmt.Errorf("unknown placeholder %q", k)
+		}
 	}
 	return out, nil
 }
 
-// Marshal returns the pretty-printed JSON encoding. Used by the
-// store for atomic writes.
-func (r *Recipe) Marshal() ([]byte, error) {
-	r.Updated = time.Now().UTC()
-	return json.MarshalIndent(r, "", "  ")
-}
+var placeholderRE = regexp.MustCompile(`\{[a-zA-Z0-9_]+\}`)
 
-// Unmarshal parses a recipe from JSON. It also stamps SchemaVersion
-// if missing (for hand-written recipes).
-func Unmarshal(data []byte) (*Recipe, error) {
-	var r Recipe
-	if err := json.Unmarshal(data, &r); err != nil {
+func loadFile(path string) (*Recipe, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return nil, err
 	}
-	if r.SchemaVersion == 0 {
-		r.SchemaVersion = CurrentSchemaVersion
-	}
-	if r.Endpoints == nil {
-		r.Endpoints = map[string]Endpoint{}
+	var r Recipe
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("recipe: parse %s: %w", path, err)
 	}
 	return &r, nil
+}
+
+func atomicWrite(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".recipe-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("recipe: create tmp: %w", err)
+	}
+	tmpName := tmp.Name()
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("recipe: write: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("recipe: sync: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("recipe: close: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		return fmt.Errorf("recipe: chmod: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("recipe: rename: %w", err)
+	}
+	success = true
+	return nil
+}
+
+func validDomain(domain string) bool {
+	if domain == "" || len(domain) > 253 {
+		return false
+	}
+	if strings.ContainsAny(domain, "/\\\x00\n ") {
+		return false
+	}
+	if !strings.Contains(domain, ".") {
+		return false
+	}
+	return true
 }

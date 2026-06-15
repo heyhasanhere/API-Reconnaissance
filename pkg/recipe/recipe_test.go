@@ -1,248 +1,208 @@
 package recipe
 
 import (
-	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestNew(t *testing.T) {
-	r := New("anikage.cc")
-	if r.SchemaVersion != CurrentSchemaVersion {
-		t.Errorf("SchemaVersion = %d, want %d", r.SchemaVersion, CurrentSchemaVersion)
-	}
-	if r.Domain != "anikage.cc" {
-		t.Errorf("Domain = %q, want anikage.cc", r.Domain)
-	}
-	if r.Endpoints == nil {
-		t.Error("Endpoints should be initialized to empty map")
-	}
-	if r.Discovered.IsZero() {
-		t.Error("Discovered should be set")
-	}
-	if r.Updated.IsZero() {
-		t.Error("Updated should be set")
-	}
-}
-
-func TestValidate(t *testing.T) {
-	cases := []struct {
-		name    string
-		mutate  func(*Recipe)
-		wantErr string
-	}{
-		{"good", func(r *Recipe) {
-			r.Endpoints["episodes"] = Endpoint{
-				URL: "https://example.com/api/episodes", Method: "GET", Shape: "json_list",
-			}
-		}, ""},
-		{"nil recipe", func(r *Recipe) { _ = r }, ""}, // we'll override
-		{"missing domain", func(r *Recipe) { r.Domain = "" }, "domain is empty"},
-		{"bad schema version", func(r *Recipe) { r.SchemaVersion = 99 }, "schema_version 99 is newer"},
-		{"endpoint empty URL", func(r *Recipe) {
-			r.Endpoints["x"] = Endpoint{URL: "", Method: "GET", Shape: "json"}
-		}, "endpoint \"x\" has empty URL"},
-		{"endpoint empty method", func(r *Recipe) {
-			r.Endpoints["x"] = Endpoint{URL: "https://e.com", Method: "", Shape: "json"}
-		}, "endpoint \"x\" has empty method"},
-		{"endpoint bad URL", func(r *Recipe) {
-			r.Endpoints["x"] = Endpoint{URL: "ht tp://bad", Method: "GET", Shape: "json"}
-		}, "does not parse"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var r *Recipe
-			if tc.name == "nil recipe" {
-				err := error((func() error { r = nil; return r.Validate() })())
-				if err == nil {
-					t.Error("nil recipe should error")
-				}
-				return
-			}
-			r = New("example.com")
-			tc.mutate(r)
-			err := r.Validate()
-			if tc.wantErr == "" {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("error = %q, want substring %q", err.Error(), tc.wantErr)
-			}
-		})
-	}
-}
-
-func TestPlaceholders(t *testing.T) {
-	cases := []struct {
-		url  string
-		want []string
-	}{
-		{"https://example.com/api/foo", nil},
-		{"https://example.com/anime/{slug}", []string{"slug"}},
-		{"https://example.com/anime/{slug}/episodes/{n}", []string{"slug", "n"}},
-		{"https://example.com/anime/{slug}/episodes/{slug}", []string{"slug"}}, // dedup
-	}
-	for _, tc := range cases {
-		t.Run(tc.url, func(t *testing.T) {
-			e := &Endpoint{URL: tc.url, Method: "GET"}
-			got := e.Placeholders()
-			if len(got) != len(tc.want) {
-				t.Fatalf("Placeholders() = %v, want %v", got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Errorf("Placeholders()[%d] = %q, want %q", i, got[i], tc.want[i])
-				}
-			}
-		})
-	}
-}
-
-func TestFill(t *testing.T) {
-	e := &Endpoint{
-		URL:    "https://anikage.cc/api/media/anime/{slug}/episodes/{n}/sources",
-		Method: "GET",
-	}
-
-	t.Run("ok", func(t *testing.T) {
-		got, err := e.Fill(map[string]string{"slug": "zMLNvt6MtV", "n": "1"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := "https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/1/sources"
-		if got != want {
-			t.Errorf("Fill = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("missing", func(t *testing.T) {
-		_, err := e.Fill(map[string]string{"slug": "zMLNvt6MtV"})
-		if err == nil {
-			t.Fatal("expected error for missing placeholder")
-		}
-		if !strings.Contains(err.Error(), "{n}") {
-			t.Errorf("error should mention {n}: %v", err)
-		}
-	})
-
-	t.Run("unknown", func(t *testing.T) {
-		_, err := e.Fill(map[string]string{"slug": "z", "n": "1", "extra": "x"})
-		if err == nil {
-			t.Fatal("expected error for unknown placeholder")
-		}
-		if !strings.Contains(err.Error(), "{extra}") {
-			t.Errorf("error should mention {extra}: %v", err)
-		}
-	})
-
-	t.Run("value with special chars gets escaped", func(t *testing.T) {
-		got, err := e.Fill(map[string]string{"slug": "a b/c", "n": "1"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		// url.PathEscape encodes space as %20 and / as %2F.
-		// The slug segment in the output should contain neither raw
-		// space nor raw /.
-		want := "https://anikage.cc/api/media/anime/a%20b%2Fc/episodes/1/sources"
-		if got != want {
-			t.Errorf("Fill = %q, want %q", got, want)
-		}
-	})
-}
-
-func TestRoundtrip(t *testing.T) {
-	r := New("anikage.cc")
-	r.Endpoints["episodes"] = Endpoint{
-		URL:    "https://anikage.cc/api/media/anime/{slug}/episodes",
-		Method: "GET",
-		Params: []string{"page"},
-		Shape:  "json_list",
-	}
-	r.Endpoints["sources"] = Endpoint{
-		URL:    "https://anikage.cc/api/media/anime/{slug}/episodes/{n}/sources",
-		Method: "GET",
-		Params: []string{"provider", "lang"},
-		Shape:  "stream_key",
-	}
-	r.Auth.RequiredHeaders = map[string]string{
-		"Origin":  "https://anikage.cc",
-		"Referer": "https://anikage.cc/",
-	}
-	r.CDN = &CDN{Host: "prox.anikage.cc", InheritsAuth: true}
-	r.Download = &Download{Shape: "hls", Tool: "yt-dlp", Flags: []string{"--concurrent-fragments", "16"}}
-
-	data, err := r.Marshal()
+func TestFillTemplate_OK(t *testing.T) {
+	got, err := FillTemplate("/api/{slug}/episodes/{n}",
+		map[string]string{"slug": "abc", "n": "1"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("err: %v", err)
 	}
-	// Pretty-printed — should contain newlines and indentation.
-	if !strings.Contains(string(data), "\n  ") {
-		t.Errorf("expected pretty-printed JSON, got %q", data)
-	}
-
-	loaded, err := Unmarshal(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Domain != r.Domain {
-		t.Errorf("Domain = %q, want %q", loaded.Domain, r.Domain)
-	}
-	if len(loaded.Endpoints) != 2 {
-		t.Errorf("Endpoints count = %d, want 2", len(loaded.Endpoints))
-	}
-	if loaded.Endpoints["episodes"].URL != r.Endpoints["episodes"].URL {
-		t.Errorf("episodes URL = %q, want %q", loaded.Endpoints["episodes"].URL, r.Endpoints["episodes"].URL)
-	}
-	if loaded.CDN == nil || loaded.CDN.Host != "prox.anikage.cc" {
-		t.Errorf("CDN roundtrip lost: %+v", loaded.CDN)
-	}
-	if loaded.Download == nil || loaded.Download.Tool != "yt-dlp" {
-		t.Errorf("Download roundtrip lost: %+v", loaded.Download)
+	if got != "/api/abc/episodes/1" {
+		t.Errorf("got %q, want /api/abc/episodes/1", got)
 	}
 }
 
-func TestUnmarshalStampsSchemaVersion(t *testing.T) {
-	// Hand-written recipe without schema_version.
-	data := []byte(`{"domain":"x.com","endpoints":{"e":{"url":"https://x.com/e","method":"GET","shape":"json"}}}`)
-	r, err := Unmarshal(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.SchemaVersion != CurrentSchemaVersion {
-		t.Errorf("SchemaVersion = %d, want %d (should stamp)", r.SchemaVersion, CurrentSchemaVersion)
+func TestFillTemplate_Missing(t *testing.T) {
+	_, err := FillTemplate("/api/{slug}/episodes/{n}",
+		map[string]string{"slug": "abc"})
+	if err == nil {
+		t.Error("expected error for missing placeholder {n}")
 	}
 }
 
-func TestUnmarshalInitializesEndpoints(t *testing.T) {
-	// Hand-written recipe without endpoints key.
-	data := []byte(`{"schema_version":1,"domain":"x.com"}`)
-	r, err := Unmarshal(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Endpoints == nil {
-		t.Error("Endpoints should be initialized")
+func TestFillTemplate_Unknown(t *testing.T) {
+	_, err := FillTemplate("/api/{slug}/x",
+		map[string]string{"slug": "abc", "extra": "y"})
+	if err == nil {
+		t.Error("expected error for unknown placeholder")
 	}
 }
 
-func TestMarshalIsJSON(t *testing.T) {
-	r := New("example.com")
-	r.Endpoints["e"] = Endpoint{URL: "https://e.com/e", Method: "GET", Shape: "json"}
-	data, err := r.Marshal()
+func TestSave_LoadRoundtrip(t *testing.T) {
+	root := t.TempDir()
+	s, err := NewStoreAt(root)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewStoreAt: %v", err)
 	}
-	var anyMap map[string]any
-	if err := json.Unmarshal(data, &anyMap); err != nil {
-		t.Fatalf("Marshal output is not valid JSON: %v\n%s", err, data)
+	r := &Recipe{
+		Domain: "example.com",
+		Chain: []Step{
+			{Name: "episodes", URLTemplate: "/api/{slug}/episodes", Method: "GET"},
+			{Name: "sources", URLTemplate: "/api/{slug}/episodes/{n}/sources?provider={p}", Method: "GET",
+				Placeholders: []string{"slug", "n", "p"}, RequiredParams: []string{"provider"}},
+		},
+		Providers: []Provider{
+			{Name: "miko", IsHLS: true},
+		},
+		Headers:        map[string]string{"Origin": "https://example.com"},
+		StreamTemplate: "https://cdn.example/m3u8/{key}",
 	}
-	if anyMap["domain"] != "example.com" {
-		t.Errorf("domain in output = %v, want example.com", anyMap["domain"])
+	if err := s.Save(r); err != nil {
+		t.Fatalf("Save: %v", err)
 	}
+
+	// Check mode 0600.
+	info, err := os.Stat(s.Path("example.com"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("perm = %o, want 0600", perm)
+	}
+
+	got, err := s.Load("example.com")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Domain != "example.com" {
+		t.Errorf("Domain = %q, want example.com", got.Domain)
+	}
+	if len(got.Chain) != 2 {
+		t.Errorf("Chain length = %d, want 2", len(got.Chain))
+	}
+	if got.StreamTemplate != "https://cdn.example/m3u8/{key}" {
+		t.Errorf("StreamTemplate = %q", got.StreamTemplate)
+	}
+}
+
+func TestSave_PreservesDiscovered(t *testing.T) {
+	root := t.TempDir()
+	s, _ := NewStoreAt(root)
+	first := &Recipe{Domain: "example.com", Chain: []Step{{Name: "a", URLTemplate: "/a"}}}
+	if err := s.Save(first); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	loaded, _ := s.Load("example.com")
+	originalDiscovered := loaded.Discovered
+
+	// Second save with a different chain.
+	second := &Recipe{Domain: "example.com", Chain: []Step{{Name: "b", URLTemplate: "/b"}}}
+	if err := s.Save(second); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	loaded2, _ := s.Load("example.com")
+	if !loaded2.Discovered.Equal(originalDiscovered) {
+		t.Errorf("Discovered changed: was %v, now %v", originalDiscovered, loaded2.Discovered)
+	}
+}
+
+func TestList_Empty(t *testing.T) {
+	root := t.TempDir()
+	s, _ := NewStoreAt(root)
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("List = %v, want []", got)
+	}
+}
+
+func TestList_Sorted(t *testing.T) {
+	root := t.TempDir()
+	s, _ := NewStoreAt(root)
+	for _, d := range []string{"zeta.com", "alpha.com", "mike.com"} {
+		_ = s.Save(&Recipe{Domain: d, Chain: []Step{{Name: "x", URLTemplate: "/x"}}})
+	}
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []string{"alpha.com", "mike.com", "zeta.com"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("List = %v, want %v", got, want)
+	}
+}
+
+func TestLoad_Missing(t *testing.T) {
+	root := t.TempDir()
+	s, _ := NewStoreAt(root)
+	_, err := s.Load("nope.com")
+	if err == nil {
+		t.Error("expected error for missing recipe")
+	}
+}
+
+func TestSave_InvalidDomain(t *testing.T) {
+	root := t.TempDir()
+	s, _ := NewStoreAt(root)
+	if err := s.Save(&Recipe{Domain: ""}); err == nil {
+		t.Error("expected error for empty domain")
+	}
+	if err := s.Save(&Recipe{Domain: "../escape"}); err == nil {
+		t.Error("expected error for path-traversal domain")
+	}
+}
+
+func TestAtomicWrite_NoTempLeftovers(t *testing.T) {
+	root := t.TempDir()
+	s, _ := NewStoreAt(root)
+	for i := 0; i < 5; i++ {
+		_ = s.Save(&Recipe{Domain: "example.com", Chain: []Step{{Name: "x", URLTemplate: "/x"}}})
+	}
+	entries, _ := os.ReadDir(root)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover tmp file: %s", e.Name())
+		}
+	}
+	// Should be exactly the one .json file.
+	jsons := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".json") {
+			jsons++
+		}
+	}
+	if jsons != 1 {
+		t.Errorf("json count = %d, want 1", jsons)
+	}
+}
+
+func TestValidDomain(t *testing.T) {
+	good := []string{"example.com", "a.b.c", "sub.domain.example.com"}
+	bad := []string{"", "no-dot", "../escape", "/abs/path", "with space.com"}
+	for _, d := range good {
+		if !validDomain(d) {
+			t.Errorf("validDomain(%q) = false, want true", d)
+		}
+	}
+	for _, d := range bad {
+		if validDomain(d) {
+			t.Errorf("validDomain(%q) = true, want false", d)
+		}
+	}
+}
+
+func TestNewStoreAt_EmptyRoot(t *testing.T) {
+	if _, err := NewStoreAt(""); err == nil {
+		t.Error("expected error for empty root")
+	}
+}
+
+func TestNewStoreAt_CreatesDir(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "nested", "recipes")
+	s, err := NewStoreAt(root)
+	if err != nil {
+		t.Fatalf("NewStoreAt: %v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Errorf("dir not created: %v", err)
+	}
+	_ = s
 }
