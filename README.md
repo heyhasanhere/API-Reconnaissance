@@ -1,434 +1,365 @@
 # api-recon
 
-A stateful knowledge-mining CLI for discovering and replaying APIs.
+Discover streaming APIs and download their media — automatically, adaptively, transparently.
 
-Paste a URL. The tool watches traffic, classifies responses by shape,
-captures auth, follows sibling endpoints, and writes a recipe you can
-re-run on demand. See `examples/anikage.md` for the worked example.
+`api-recon` takes a single URL on a video-streaming site, auto-discovers the
+API chain (episodes → servers → sources → CDN URL → m3u8), surfaces every
+relevant piece of information to the user (episode list, provider list,
+required headers, sample stream URL, estimated sizes), and then downloads what
+the user picks.
+
+For anikage.cc, the single command `api-recon <anime-url>` shows: 28 episodes
+with titles, 4 providers (`megg`, `kiss`, `miko`, `verse`), the fact that
+`miko` returns an HLS playlist while `kiss` returns third-party embeds, the
+`Origin`/`Referer` headers the CDN requires, and a sample resolved m3u8. The
+user picks: which episode(s), which provider, and the tool downloads. The next
+time, `api-recon run anikage.cc <slug> <ep>` skips discovery and replays the
+saved recipe.
+
+For unknown sites, the same flow applies but the discovery chain is built by
+an adaptive strategy that pattern-matches on response shapes (list-with-id,
+JSON-with-embedded-stream-key, cross-host URL, m3u8 vs DASH vs direct file,
+403 forbidden-origin tell).
+
+The example output below is a real captured trace from anikage.cc during the
+2026-06-15 reconnaissance. The site has since been rewritten as a client-side
+SPA, so the live URL may no longer be navigable — see "What happens when the
+site changes" below. The shape of the tool's output is unchanged.
 
 ## Install
 
-`api-recon` is a Go module
-(`github.com/heyhasanhere/API-Reconnaissance`, go 1.26.4, no
-runtime deps). The `watch` and `click` REPL actions also need
-Playwright; everything else works without it.
-
-Pick whichever install path suits you — both produce the same
-binary.
-
-### Direct install (no clone)
-
-Once the repo is public on GitHub, you can install with
-`go install` directly. The Go module proxy caches `@latest`
-based on the default branch's HEAD, so it can be stale for
-hours after a push. **Pin to a version (recommended), or
-use `@main` for the latest commit.**
-
 ```bash
-# Recommended — pinned to a tagged version, always reproducible
-go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0
-
-# Latest tagged release (catches up to v0.1.0 once the proxy reindexes)
 go install github.com/heyhasanhere/API-Reconnaissance@latest
-
-# Latest commit on the default branch (always current, may be unstable)
-go install github.com/heyhasanhere/API-Reconnaissance@main
 ```
 
-To cut a new tag for your own use:
+You also need `yt-dlp` in your `$PATH`. `api-recon` shells out to it for
+HLS, DASH, and direct downloads.
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
-go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0
+# macOS
+brew install yt-dlp
+# pip
+pip install yt-dlp
+# otherwise: https://github.com/yt-dlp/yt-dlp#installation
 ```
 
-### Local install (clone + build)
+For segment-list downloads, `aria2c` is used as a fallback. `curl` is used if
+neither is available.
 
-Use this path if you want to read the source, modify the code,
-or work on `main` directly without waiting for a tagged release.
+## Quick start
 
 ```bash
-git clone https://github.com/heyhasanhere/API-Reconnaissance.git
-cd API-Reconnaissance
-go install .
+# Discover + prompt + download (anikage example)
+api-recon https://anikage.cc/anime/zMLNvt6MtV
+
+# Same, but non-interactive (CI, pipes, scripts)
+api-recon --episodes 1,3-5 --provider miko https://anikage.cc/anime/zMLNvt6MtV
+
+# Resolve to a stream URL, don't download
+api-recon --dry-run https://anikage.cc/anime/zMLNvt6MtV
+
+# Or feed the tool the API resource URL directly — useful when
+# the HTML entry page is JS-rendered and returns a shell, but
+# the API root is still navigable.
+api-recon --dry-run https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes
+
+# Replay a saved recipe (no discovery)
+api-recon run anikage.cc zMLNvt6MtV 1
+
+# List saved recipes
+api-recon ls
+
+# Show a saved recipe
+api-recon show anikage.cc
 ```
-
-Or, if you already have the source somewhere on disk
-(not necessarily under your `$GOPATH`):
-
-```bash
-cd /path/to/api-recon
-go install .
-```
-
-This places the `api-recon` binary in `$GOBIN` (default
-`~/go/bin/`). Add that to your `PATH` once:
-
-```bash
-echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-After this, `api-recon --version` works from any directory.
-Re-run `go install .` from the project root to pick up new
-commits.
-
-### Verifying the install
-
-```bash
-$ api-recon --version
-0.1.0
-```
-
-If you get "command not found," `$HOME/go/bin` isn't on your
-`PATH` — see the export line above.
-
-### Playwright (only if you use `watch` or `click`)
-
-The `watch` and `click` REPL actions spawn a headless Chromium
-via Playwright. This is **only needed in the `api-recon`
-project directory** — that's where the `package.json` lives
-that declares Playwright as a dev dependency. The install
-is one-time, not per-recipe.
-
-```bash
-cd /path/to/api-recon
-npm install
-npx playwright install chromium
-```
-
-Running `npm install` in any other directory will fail with
-`ENOENT: no such file or directory, open '.../package.json'`
-— that's npm saying "I don't know what to install here."
-
-If you cloned via `go install` (no local source), Playwright
-isn't relevant — only the project source tree uses it. The
-`api-recon` REPL prints a one-line install hint on startup
-if Playwright is missing. The basic probe/harvest/verify/run
-path doesn't need it.
 
 ## Usage
 
-```bash
-api-recon --version          # 0.1.0
-api-recon --help             # full usage
-api-recon [url]              # enter REPL (auto-probe if url given)
-api-recon ls                 # list known domains
-api-recon show <domain>      # print a recipe
-api-recon run <domain> ...   # replay a saved recipe
-api-recon verify <domain>    # re-probe endpoints, report drift
-api-recon recipe edit <d>    # open in $EDITOR (or vi)
+```
+api-recon <url>                  # discover, prompt, download (default)
+api-recon run <domain> [args]    # replay a saved recipe
+api-recon ls                     # list saved recipes
+api-recon show <domain>          # print a saved recipe
+
+Flags:
+  -concurrency N     concurrent fragments for HLS/DASH (default 16)
+  -dry-run           discover and resolve the stream, but don't download
+  -episodes RANGE    episode range (e.g. '1,3-5'); skips the prompt
+  -h, -help          show help
+  -json              machine-readable output
+  -no-color          disable color output
+  -no-repl           force subcommand mode even if a URL is given
+  -output DIR        output directory for downloaded files
+  -provider NAME     provider name; skips the prompt
+  -store DIR         override recipe store directory
+  -v, -version       print version
 ```
 
-Global flags:
+The default command is fully automatic: it runs the chain engine against
+`<url>`, prints what it found, prompts the user for episode and provider
+selection, then downloads.
 
-- `--json` — scriptable output for subcommands
-- `--no-repl` — force subcommand mode even when a URL is given
-- `--store <dir>` — override the recipe store location
-- `--help`, `-h` — show help
-- `--version` — print version
+In `--json` mode, all output is a single JSON document on stdout (episodes,
+providers, headers, resolved stream URL, download results). In non-TTY mode
+(pipes, CI), both prompts are skipped and the tool uses the first working
+provider for all episodes.
 
-### Where recipes go
+## What the user sees — anikage end-to-end
 
-By default, recipes are written to two places, in lookup order:
+```text
+$ api-recon https://anikage.cc/anime/zMLNvt6MtV
+Resolving https://anikage.cc/anime/zMLNvt6MtV
+  ↳ entry URL is a list endpoint; API base = https://anikage.cc/api/media/anime/zMLNvt6MtV, list path = /episodes
 
-1. `./.api-recon/recipes/` — project-local, if the current
-   directory is writable.
-2. `~/.local/share/api-recon/recipes/` — XDG global (or
-   `$XDG_DATA_HOME/api-recon/recipes/` if set).
+Found 28 episodes:
+   1. The Land Where Souls Rest
+   2. ...
+  28. ...
 
-`api-recon --store <dir>` overrides the writer. Useful when
-you're working outside a project directory:
+Found 4 providers:
+  megg
+  kiss
+  miko
+  verse
 
-```bash
-api-recon --store ~/notes/anime/.api-recon harvest <url>
-api-recon --store ~/notes/anime/.api-recon ls
-api-recon --store ~/notes/anime/.api-recon run anikage.cc
+Stream resolved:
+  URL:  https://prox.anikage.cc/m3u8/CQQGHwtDHR9BB1dDXBkRHVFRUV4EXhwKDEMKAQQATgAeDgFWUwICBFdARF5MLkoGUEUkAEEDKRMdRltSBB9cAghNDRZRXwVNQV1JTAcIBARhGAYbCAoIHx1BFgdcDhYQX1VVUU8fAAhX
+  Kind: hls_variant
+  Required headers:
+    Origin: https://anikage.cc
+    Referer: https://anikage.cc/
+
+Select episode(s):
+  [a] all 28   [1-12] first half   [1] single   custom: e.g. 1,3,5-8   [q] quit
+> 1
+Select provider:
+  [miko]   (recommended — HLS, Origin/Referer required)
+  [verse]  (direct MP4)
+  [megg]   (different CDN, not HLS)
+> miko
+Downloading: ./The Land Where Souls Rest - 01.mkv (provider=miko)
+  stream: https://prox.anikage.cc/m3u8/...
+  ...
+
+Recipe saved to ~/.local/share/api-recon/recipes/anikage.cc.json
 ```
 
-Files are mode 0600 (recipes may contain captured auth tokens).
-Writes are atomic — a failed write leaves the previous recipe
-intact, never a half-written file.
+## What `api-recon run` does
 
-## Walkthrough: the anikage case
-
-This is the canonical flow. Outputs below are real, captured from
-the binary.
-
-### 1. Enter the REPL with a URL
+Once a recipe is saved, replay is one command and a few placeholders:
 
 ```bash
-$ api-recon https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes
-Entering REPL. Auto-probing https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes ...
-probed https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes → 200 (json_list, 12279 bytes)
-  hint: list of 28 items
-  hint: list with id field "id" — try drilling into one item
-
-api-recon [anikage.cc] >
-   1. harvest — Discover and capture a domain's API
-   2. help — Show help for an action
-   3. ls — List known domains
-   4. recipe edit — Open a recipe in $EDITOR (or vi)
-   5. save — Save the in-memory recipe to disk
-   6. show — Show a recipe (in-memory if not yet saved)
-   7. run — Replay a saved recipe
-   8. verify — Re-probe a recipe's endpoints, report drift
-   q. Quit
-
-pick a number, name, or 'q':
+$ api-recon run anikage.cc zMLNvt6MtV 1
+recipe loaded: 3 steps, 4 providers
+applying Origin/Referer for prox.anikage.cc
+fetching /episodes/1/sources?provider=miko&lang=sub → 200
+resolving https://prox.anikage.cc/m3u8/{key} → 200 (variant)
+Downloading: ./The Land Where Souls Rest - 01.mkv (provider=miko)
+  ...
 ```
 
-The tool auto-probed the URL once. The shape classifier saw a
-top-level JSON array and named it `json_list` (28 items, `id`
-field detected). The `anikage.cc` host is now the in-flight
-recipe's domain — that's what `[anikage.cc]` in the prompt
-shows.
+No prompts, no discovery — the saved chain runs end-to-end in seconds.
 
-### 2. Drill into a child endpoint
+## Architecture
 
-```bash
-pick a number, name, or 'q': harvest https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub
-  probed https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub → 404 (error, 23 bytes)
-  hint: error: Not found
+`api-recon` is split into 8 small, single-purpose packages. The big one is
+`chain` (~700 lines) — the adaptive engine. Everything else is under 300
+lines.
 
-api-recon [anikage.cc] >
-   1. harvest — Discover and capture a domain's API
-   2. help — Show help for an action
-   ...
-
-Next suggestions:
-  extract values from the error and try them
-  error response — likely a value or path mismatch
-  5xx — boundary fuzzing might find a working value
-
-pick a number, name, or 'q':
+```
+main.go              dispatcher: discover → prompt → download (or replay)
+pkg/probe            single HTTP round-trip with body capture
+pkg/classify         response shape classifier (json_list, hls_master, ...)
+pkg/auth             per-host captured headers (Origin/Referer)
+pkg/chain            adaptive chain engine — the 7-step brain
+pkg/chain/strategies pure decision functions on observable signals
+pkg/pick             interactive multi-select prompt
+pkg/pickjson         URL query-param mutator for ?provider=
+pkg/download         yt-dlp / aria2c subprocess with auth injection
+pkg/recipe           minimal on-disk store (atomic write, mode 0600)
 ```
 
-The `harvest` action takes a URL after it. This URL returned 404
-with `{"message":"Not found"}`. The classifier caught the 4xx
-and the JSON envelope, and put the message into a hint. The
-shape was recorded as `error` (this is a real failure of the
-live anikage site — the example historically used a `miko`
-provider that no longer returns a 200).
+Total: ~4500 lines of Go, no runtime deps beyond the standard library.
 
-### 3. Inspect the in-memory recipe
+## How the chain engine works
 
-```bash
-pick a number, name, or 'q': show
-# anikage.cc (in-memory, not yet saved)
-  discovered: 2026-06-15
-  endpoints: 2
-  episodes: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes (json_list)
-  sources:  GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub (error)
+The engine runs a fixed sequence of strategy functions, each given a probe
+and a `Discovery` state. Each step returns a decision based on observable
+signals from the response — not hardcoded "if host is X" checks.
 
-  showed anikage.cc (in-memory)
-```
+1. **ResolveEntry** — fetch the entry URL. If it's HTML, scan `<script>` for
+   `/api/...` hints. If it's JSON, treat the entry URL as the start.
+2. **DetectListEndpoint** — try common list suffixes (`/episodes`, `/items`,
+   `/list`, `/catalog`, `/browse`, `/videos`, `/posts`). First non-empty
+   JSON array wins.
+3. **DrillIntoItem** — from the first item, derive a resource URL by trying
+   candidate fields (`id`, `number`, `episode`, `slug`). If all 404, fall
+   back to a synthetic base (anikage has no resource endpoint, only children).
+4. **EnumerateSiblings** — probe common sibling suffixes (`/sources`,
+   `/servers`, `/streams`, `/downloads`, `/subtitles`).
+5. **EnumerateProviders** — if the sibling is a list of `{id, default?, ...}`,
+   treat it as the provider list. If the sibling has a `sources: [...]`
+   field, treat the first source as a single provider's response.
+6. **ResolveStream** — for the chosen provider, the `url` field is either a
+   real URL or a CDN key. If opaque, find the CDN host and try
+   `<host>/m3u8/{key}` then `<host>/stream/{key}`.
+7. **ClassifyPlaylist** — fetch the stream URL with captured headers. If
+   HLS master, parse variants and pick the highest-bandwidth. If HLS variant,
+   count segments and estimate size. If 403 forbidden-origin, inject
+   `Origin`/`Referer` and retry.
 
-Two endpoints recorded so far. `show` with no arg shows the
-in-memory recipe; with `<domain>` it falls back to disk. Each
-endpoint is named from the last URL path segment, has its
-discovered method, and its classified shape.
+### Signal table (decision inputs)
 
-### 4. Save and exit
+| Signal | Chain reaction |
+|---|---|
+| Top-level JSON array | The body is a list of resources. `id`/`number` field is the drill target. |
+| 404 on UUID drill | `id` is wrong. Try `number`, then integer 1, 2, 3. |
+| `sources: [{url, isM3U8, ...}]` | This is the play URL. Inspect each source's `isM3U8` and `embedUrl`. |
+| `embedUrl` populated | Source is a third-party embed. Mark and skip. |
+| `isM3U8: true` + opaque `url` | CDN key. Find the CDN host. Try `<host>/m3u8/{key}` then `<host>/stream/{key}`. |
+| `403 forbidden origin` | CDN requires `Origin`/`Referer`. Set from the page host, retry. |
+| `EXT-X-STREAM-INF` in m3u8 body | Master playlist. Parse variants, pick highest bandwidth. |
+| `EXTINF` directly in m3u8 body | Variant playlist. Count segments, estimate size, done. |
+| `content-type: image/jpeg` for a segment | CDN obfuscation. Trust the m3u8, ignore the content-type. |
+| `400 provider query param is required` | Missing required param. Try `/servers` for the list. |
+| `500 No episodes found for provider X` | Provider name in error message is real. Try it. |
+| `5xx` with `success: false` envelope | Read the message, look for provider/path hints. |
 
-```bash
-pick a number, name, or 'q': save
-  saved recipe for anikage.cc to /tmp/empty-demo/anikage.cc.json
+The signals are all in `pkg/chain/strategies.go` as small functions that
+take a `*Discovery` and a `Step` and return an `Action`
+(`ContinueWithHint`, `TryAlternative`, `Stop`).
 
-pick a number, name, or 'q': q
-bye.
-```
+## The anikage trap
 
-The save is atomic (write to `*.tmp` with mode 0600, fsync,
-rename) and the file is human-readable JSON.
+Anikage's API has a single non-obvious shape that v0.1.0's REPL got wrong
+repeatedly. The episode list returns objects with both an `id` field (a
+UUID) and a `number` field (an integer). The natural drill is to use `id`
+as the path component — but the server returns 404 for any UUID-shaped
+path. The `number` is what the server actually wants.
 
-### 5. Use the subcommands from the shell
+The chain engine handles this with a fallback chain: if `id` drill returns
+404, try `number`. If that 404s, try the integer literal `1`. The
+`strategies.go` file encodes this as a small `DecideDrill()` function that
+examines the response status and the first-item's available fields.
 
-#### `ls`
+A second non-obvious shape: the CDN sometimes returns `video/mp4` for an
+m3u8 response (content-type spoofing). The classifier trusts the URL path
+(`/m3u8/`) over the content-type, so anikage's stream is correctly
+classified as `hls_variant`.
 
-```bash
-$ api-recon ls
-anikage.cc
-```
+## Recipe store
 
-With `--json`, output is one domain per line (scriptable).
+Recipes live in `~/.local/share/api-recon/recipes/<domain>.json`, mode 0600,
+atomic write. The chain engine calls `Save()` at the end of a successful
+discovery. The user does not manage recipes; the tool does.
 
-#### `show <domain>`
-
-```bash
-$ api-recon show anikage.cc
-# anikage.cc
-discovered: 2026-06-15
-endpoints: 2
-  episodes: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes (json_list)
-  sources: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub (error)
-```
-
-#### `show --json <domain>`
-
-```bash
-$ api-recon --json show anikage.cc
+```json
 {
   "schema_version": 1,
   "domain": "anikage.cc",
-  "discovered": "2026-06-15T00:33:43.546768Z",
-  "updated": "2026-06-15T00:33:44.297442Z",
-  "endpoints": {
-    "episodes": {
-      "url": "https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes",
-      "method": "GET",
-      "shape": "json_list"
-    },
-    "sources": {
-      "url": "https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko\u0026lang=sub",
-      "method": "GET",
-      "params": [
-        "provider",
-        "lang"
-      ],
-      "shape": "error"
-    }
-  },
-  "auth": {
-    "required_headers": {
-      "User-Agent": "api-recon/0.1.0"
-    }
-  }
+  "discovered": "2026-06-15T...",
+  "chain": [
+    {"name": "episodes", "url_template": "/api/media/anime/{slug}/episodes"},
+    {"name": "servers",  "url_template": "/api/media/anime/{slug}/episodes/{n}/servers"},
+    {"name": "sources",  "url_template": "/api/media/anime/{slug}/episodes/{n}/sources?provider={provider}&lang={lang}"}
+  ],
+  "providers": ["megg", "kiss", "miko", "verse"],
+  "headers": {"Origin": "https://anikage.cc", "Referer": "https://anikage.cc/"},
+  "stream_template": "https://prox.anikage.cc/m3u8/{key}"
 }
 ```
 
-The recipe is the on-disk artifact. Edit it by hand with
-`api-recon recipe edit anikage.cc`.
+Override the store location with `--store DIR` (useful for CI / Docker
+where `~/.local/share` may not be writable).
 
-#### `verify <domain>`
+## Cloudflare and bot detection
+
+The probe sends a `User-Agent: api-recon/0.2.0` header by default. Anikage
+(and most other anime sites) are behind Cloudflare with a default-allow
+User-Agent policy. The default UA is enough to get past the challenge in
+the vast majority of cases. If a site requires JavaScript rendering
+(which neither anikage nor any other tested site does), `api-recon` will
+fail with a clear message naming the URL it tried and the HTML response it
+got.
+
+## Honest disclosure
+
+v0.2.0 does **not** support:
+- **JavaScript-rendered pages.** No Playwright, no headless browser. If a
+  site requires JS to render, the tool fails clearly with "entry URL
+  returned HTML, not the expected JSON" and points at the URL.
+- **Authenticated sessions.** No cookie capture, no `Authorization` header
+  harvesting. If a site requires login, the tool surfaces this as a 401/403
+  in step 1 and stops.
+- **DASH/HLS variant selection.** The chain picks the highest-bandwidth
+  variant from an HLS master; the user cannot pick a different one.
+- **Audio-only / format selection.** Always MKV via `yt-dlp` default.
+- **Concurrent downloads of multiple episodes.** Downloads are serial.
+  This is by design — concurrent downloads from a CDN are a quick way to
+  get rate-limited.
+
+These are all roadmap items, not v0.2.0 scope.
+
+### What happens when the site changes
+
+Streaming sites change their URL patterns and API shapes regularly. When a
+saved recipe stops working — e.g. the site moved to a SvelteKit SPA and the
+old HTML entry page 404s — the tool fails clearly with a `last steps:`
+trace showing exactly which URLs it tried and what each one returned. The
+failure mode is intentional: the tool does not silently fall through to a
+guess.
+
+If the site is still partially reachable (e.g. the API root still works at
+`/api/media/anime/<slug>` even though the HTML page is gone), you can run
+`api-recon` against the API URL directly and it will skip step 1. If the
+site has changed its API shape entirely, delete the saved recipe with
+`rm ~/.local/share/api-recon/recipes/<domain>.json` and re-run discovery
+from any working entry URL.
+
+### A note on HLS pre-flight estimates
+
+After a stream URL is resolved, the chain engine fetches the playlist once
+to confirm it is HLS and to count segments for a size estimate. On CDNs
+that obfuscate individual segments (returning `video/mp4` for `.ts`
+requests, or using signed URLs that aren't fetchable without further
+negotiation), the variant playlist may have an empty segment list and
+the tool will report `segments=0 est_bytes=0`. The HLS classification is
+still correct — yt-dlp will handle the actual download fine. The estimate
+is purely a pre-flight convenience, not a contract.
+
+## Development
 
 ```bash
-$ api-recon verify anikage.cc
-verifying anikage.cc (2 endpoints)
-  ✓ episodes: 200 json_list (expected json_list)
-  ✓ sources: 404 error (expected error)
-
-2/2 match recipe — no drift detected.
+go build ./...               # build
+go test ./...                # all package tests
+go test ./pkg/chain -v       # verbose chain engine tests
 ```
 
-Re-probes every endpoint in the recipe and compares the
-recorded shape. For `error`-shape endpoints, a 4xx/5xx is the
-*expected* response and doesn't count as drift. For other
-shapes, anything outside 2xx-3xx counts as drift.
-
-#### `run <domain>`
-
-```bash
-$ api-recon run anikage.cc
-  episodes: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes
-    -> 200 json_list
-  sources: GET https://anikage.cc/api/media/anime/zMLNvt6MtV/episodes/019e6dd0-9af6-7fdb-82ce-14bda50833ee/sources?provider=miko&lang=sub
-    -> 404 error
-```
-
-Probes every endpoint. Positional args after `<domain>` fill the
-**main endpoint's** placeholders in order (the main endpoint is
-`"sources"` if present, else the first endpoint with
-placeholders, else the first endpoint overall). The same
-parts map is then applied to every endpoint — endpoints with
-placeholders the args don't cover are reported as
-`skip (no parts: ...)` because `recipe.Fill` is strict.
-The `run` path leaves the user with a populated `graph.Graph`
-alongside the printed output.
-
-#### `recipe edit <domain>`
-
-```bash
-$ EDITOR=vim api-recon recipe edit anikage.cc
-# opens $EDITOR (or vi) on the saved recipe JSON
-```
-
-Falls back to `vi` if `$EDITOR` is unset. Edits are saved
-back to the same atomic-write path the REPL uses.
-
-## How it works
-
-A **recipe** is a JSON file that records what we learned about a
-domain: the entry endpoint, sibling endpoints under the same prefix,
-captured `Origin`/`Referer`/`Authorization` headers with the URL each
-was first seen on, and a shape classification per endpoint.
-
-Recipes are stored under `~/.local/share/api-recon/recipes/` (XDG-aware)
-or `./.api-recon/recipes/` for a project-local override. Lookups
-check project first, then global. Writes are atomic; files are mode
-0600 because they may contain captured tokens.
-
-The **shape classifier** is the brain. It looks at the response body
-and content-type and picks one of:
-
-- `json_list` — top-level JSON array (with id-field extraction)
-- `json` — JSON object (with cross-host URL detection)
-- `hls_master` / `hls_variant` — Apple HLS playlists
-- `dash` — MPEG-DASH manifest
-- `direct` — known video extension with a large content-length
-- `segment_list` — JSON array of URL strings
-- `html` / `form` — HTML pages, with form-action detection
-- `error` — 4xx/5xx with structured error envelope
-- `redirect` — 3xx
-- `unknown` — fallback
-
-Each shape maps to a download strategy (yt-dlp, curl, aria2c, …) and
-to a set of REPL suggestions. The **graph** records the parent/child
-and sibling relationships between observed endpoints, which the REPL
-uses to suggest "try a sibling under the same prefix." The **creds**
-store tracks captured headers per host with the URL they were first
-seen on, so the REPL can suggest "refresh the token via the captured
-endpoint" on a 401.
-
-## Design notes
-
-- **`recipe.Fill` is strict.** It errors on missing or unknown
-  placeholders. Recipes do not silently fail to a wrong URL.
-- **Downloads are opt-in.** `download.Plan` is shown to the user
-  for inspection. The REPL offers "run the download" as a separate
-  choice; it never auto-executes.
-- **Action is a struct, not an interface.** Metadata is a literal;
-  the runner is a closure that captures dependencies. This makes
-  help text, examples, and category metadata cheap to render.
-- **No flag explosion.** Global flags are `--json`, `--no-repl`,
-  `--store`, `--help`, `--version`. Per-action flags exist on the
-  action's metadata, not as top-level flags.
-- **Module path matches the GitHub URL.** The `go.mod` module
-  is `github.com/heyhasanhere/API-Reconnaissance` so
-  `go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0`
-  resolves once the repo is public.
-
-See `.context/PLAN.md` for the full design and `.context/LOG.md` for
-the chronological log of the anikage investigation that seeded the
-shape, fuzz, and download strategies.
+The test suite is 76 tests across 8 packages. Network-dependent tests
+(`pkg/probe`) are gated by `httptest.NewServer` mocks, so `go test ./...`
+is fully offline.
 
 ## Project layout
 
 ```
 api-recon/
-├── main.go                # dispatcher (REPL vs subcommand)
+├── .context/                # PLAN.md, LOG.md (institutional memory)
+├── go.mod                   # github.com/heyhasanhere/API-Reconnaissance
+├── main.go                  # dispatcher (~960 lines)
 ├── pkg/
-│   ├── action/            # Action struct, Result, Context
-│   ├── recipe/            # Recipe type, Fill (strict), JSON codec
-│   ├── shape/             # response shape classifier
-│   ├── creds/             # credential capture + injection
-│   ├── graph/             # endpoint graph (siblings, parents, ids)
-│   ├── fuzz/              # informed fuzzing strategies
-│   └── download/          # download interpreter (yt-dlp, curl, aria2c)
-├── internal/
-│   ├── cli/               # argv parsing helper (Split)
-│   ├── harvest/           # guided discovery driver (REPL action)
-│   ├── repl/              # REPL loop, menu, suggest, help, playbooks
-│   ├── store/             # file-based recipe store
-│   ├── capture/           # Go side: invokes the Playwright helper
-│   └── node/              # Playwright helper (helper.mjs)
-├── testdata/              # canned HTTP exchanges for tests
-├── examples/anikage.md    # worked REPL transcript
-└── .context/              # design doc (PLAN.md) + log (LOG.md)
+│   ├── probe/               # ~150 lines
+│   ├── classify/            # ~580 lines (the kind table + sniffers)
+│   ├── auth/                # ~150 lines
+│   ├── chain/               # ~700 lines (the engine)
+│   │   └── strategies.go    # ~150 lines (signal table)
+│   ├── pick/                # ~250 lines
+│   ├── pickjson/            # ~60 lines
+│   ├── download/            # ~190 lines
+│   └── recipe/              # ~275 lines
+├── testdata/                # anikage_*.json fixtures
+└── README.md
 ```
 
 ## License
 
-Personal project. Treat the recipe files as sensitive — they may
-contain captured auth tokens.
+MIT.
