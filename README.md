@@ -9,11 +9,53 @@ re-run on demand. See `examples/anikage.md` for the worked example.
 ## Install
 
 `api-recon` is a Go module
-(`github.com/heyhasanhere/API-Reconnaissance`, go 1.26.4, no runtime
-deps). The `watch` and `click` REPL actions also need Playwright;
-everything else works without it.
+(`github.com/heyhasanhere/API-Reconnaissance`, go 1.26.4, no
+runtime deps). The `watch` and `click` REPL actions also need
+Playwright; everything else works without it.
 
-### Local install (you have the source)
+Pick whichever install path suits you — both produce the same
+binary.
+
+### Direct install (no clone)
+
+Once the repo is public on GitHub, you can install with
+`go install` directly. The Go module proxy caches `@latest`
+based on the default branch's HEAD, so it can be stale for
+hours after a push. **Pin to a version (recommended), or
+use `@main` for the latest commit.**
+
+```bash
+# Recommended — pinned to a tagged version, always reproducible
+go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0
+
+# Latest tagged release (catches up to v0.1.0 once the proxy reindexes)
+go install github.com/heyhasanhere/API-Reconnaissance@latest
+
+# Latest commit on the default branch (always current, may be unstable)
+go install github.com/heyhasanhere/API-Reconnaissance@main
+```
+
+To cut a new tag for your own use:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0
+```
+
+### Local install (clone + build)
+
+Use this path if you want to read the source, modify the code,
+or work on `main` directly without waiting for a tagged release.
+
+```bash
+git clone https://github.com/heyhasanhere/API-Reconnaissance.git
+cd API-Reconnaissance
+go install .
+```
+
+Or, if you already have the source somewhere on disk
+(not necessarily under your `$GOPATH`):
 
 ```bash
 cd /path/to/api-recon
@@ -28,36 +70,19 @@ echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-After this, `api-recon --version` works from any directory. Re-run
-`go install .` from the project root to pick up new commits.
+After this, `api-recon --version` works from any directory.
+Re-run `go install .` from the project root to pick up new
+commits.
 
-### Clone + build (anyone else)
-
-```bash
-git clone https://github.com/heyhasanhere/API-Reconnaissance.git
-cd API-Reconnaissance
-go install .
-```
-
-The module path matches the GitHub URL, so once the repo is public
-this also works directly. The Go module proxy caches `@latest`
-based on the default branch's HEAD, so right after a rename or
-push, prefer `@main` (or a tagged version) over `@latest` —
-the proxy can take a few hours to reindex:
+### Verifying the install
 
 ```bash
-go install github.com/heyhasanhere/API-Reconnaissance@main   # always current
-go install github.com/heyhasanhere/API-Reconnaissance@latest # once the proxy reindexes
+$ api-recon --version
+0.1.0
 ```
 
-To make `@latest` reliable immediately, push a tag and install
-the tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0
-```
+If you get "command not found," `$HOME/go/bin` isn't on your
+`PATH` — see the export line above.
 
 ### Playwright (only if you use `watch` or `click`)
 
@@ -357,7 +382,8 @@ endpoint" on a 401.
   action's metadata, not as top-level flags.
 - **Module path matches the GitHub URL.** The `go.mod` module
   is `github.com/heyhasanhere/API-Reconnaissance` so
-  `go install <url>@latest` resolves once the repo is public.
+  `go install github.com/heyhasanhere/API-Reconnaissance@v0.1.0`
+  resolves once the repo is public.
 
 See `.context/PLAN.md` for the full design and `.context/LOG.md` for
 the chronological log of the anikage investigation that seeded the
