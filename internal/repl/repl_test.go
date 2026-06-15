@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/action"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/action"
 )
 
 func TestSuggest_NoTags(t *testing.T) {

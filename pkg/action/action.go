@@ -16,10 +16,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/creds"
-	"github.com/falcon/api-recon/pkg/graph"
-	"github.com/falcon/api-recon/pkg/recipe"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/creds"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 // Flag is a single CLI flag with annotations the REPL/help text

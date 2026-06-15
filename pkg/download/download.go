@@ -18,8 +18,8 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/recipe"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 // Plan is the output of a Strategy: a list of argv to invoke, an

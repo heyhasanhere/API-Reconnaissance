@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
 )
 
 // writeSegmentList writes a JSON array of URL strings (one per

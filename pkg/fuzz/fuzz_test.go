@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
 )
 
 func TestFromErrorMessage_Anikage(t *testing.T) {

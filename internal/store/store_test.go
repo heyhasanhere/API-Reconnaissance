@@ -9,7 +9,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
 )
 
 // newTestStore returns a Store rooted at temp dirs. We can't easily

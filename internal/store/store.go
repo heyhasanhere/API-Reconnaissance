@@ -20,7 +20,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
 )
 
 // Store is the file-based recipe store. Construct with New.

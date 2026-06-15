@@ -7,11 +7,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/action"
-	"github.com/falcon/api-recon/pkg/creds"
-	"github.com/falcon/api-recon/pkg/graph"
-	"github.com/falcon/api-recon/pkg/recipe"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/action"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/creds"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 func newCtx(t *testing.T) (*action.Context, *httptest.Server) {

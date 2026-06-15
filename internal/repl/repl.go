@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/action"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/action"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 // REPL is the interactive prompt loop. Construct with New, run

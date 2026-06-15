@@ -18,7 +18,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
 )
 
 // Candidate is a single fuzzing attempt. URL is fully resolved.

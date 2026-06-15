@@ -27,14 +27,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/falcon/api-recon/internal/harvest"
-	"github.com/falcon/api-recon/internal/repl"
-	"github.com/falcon/api-recon/internal/store"
-	"github.com/falcon/api-recon/pkg/action"
-	"github.com/falcon/api-recon/pkg/creds"
-	"github.com/falcon/api-recon/pkg/graph"
-	"github.com/falcon/api-recon/pkg/recipe"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/internal/harvest"
+	"github.com/heyhasanhere/API-Reconnaissance/internal/repl"
+	"github.com/heyhasanhere/API-Reconnaissance/internal/store"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/action"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/creds"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 const usage = `api-recon — stateful knowledge-mining CLI

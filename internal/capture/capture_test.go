@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/creds"
-	"github.com/falcon/api-recon/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/creds"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
 )
 
 func TestParseEvent_Req(t *testing.T) {

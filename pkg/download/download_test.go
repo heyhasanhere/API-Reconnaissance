@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/recipe"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 func TestPlanFor_AnikageHLS(t *testing.T) {

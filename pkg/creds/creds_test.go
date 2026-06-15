@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/falcon/api-recon/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
 )
 
 func TestBearerCapture(t *testing.T) {

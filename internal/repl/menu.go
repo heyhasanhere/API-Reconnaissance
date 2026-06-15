@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/action"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/action"
 )
 
 // MenuEntry is one numbered item in the REPL menu.

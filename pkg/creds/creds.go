@@ -15,7 +15,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/falcon/api-recon/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
 )
 
 // Store holds captured credentials. Construct with New, share across

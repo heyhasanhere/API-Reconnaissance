@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/falcon/api-recon/pkg/action"
-	"github.com/falcon/api-recon/pkg/graph"
-	"github.com/falcon/api-recon/pkg/recipe"
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/action"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 // Action is the harvest action — the entry point for guided

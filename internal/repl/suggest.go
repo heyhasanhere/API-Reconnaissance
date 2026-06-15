@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/falcon/api-recon/pkg/shape"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
 )
 
 // Suggestion is one menu option the REPL shows to the user.

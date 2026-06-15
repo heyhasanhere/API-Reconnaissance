@@ -15,8 +15,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/falcon/api-recon/pkg/creds"
-	"github.com/falcon/api-recon/pkg/graph"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/creds"
+	"github.com/heyhasanhere/API-Reconnaissance/pkg/graph"
 )
 
 // Event is one parsed JSONL record from the helper.
