@@ -1,275 +1,191 @@
-// Package download is the download interpreter: given a recognized
-// response shape and a captured auth context, it produces a Plan
-// describing the right tool (yt-dlp, curl, aria2c) and argv to
-// download the source.
+// Package download shells out to yt-dlp (or aria2c / curl as
+// fallback) to fetch a stream. The package builds the argv based
+// on the stream's shape kind (HLS master / HLS variant / DASH /
+// direct / segment list), injects captured headers via
+// --add-header, and streams stdout to the caller's writer.
 //
-// The dispatch is a map[shape.Kind]Strategy, not a switch — easy to
-// extend, easy to test, easy to override.
-//
-// Execution is opt-in. By default, callers use Marshal to get the
-// argv as a script for inspection. Plan.Run actually execs the
-// process (the REPL offers this as a separate option after showing
-// the generated command).
+// The package is a thin wrapper around os/exec. The interesting
+// work is in buildArgv — that's where the yt-dlp magic numbers
+// (--concurrent-fragments 16 for HLS) come from.
 package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
-
-	"github.com/heyhasanhere/API-Reconnaissance/pkg/recipe"
-	"github.com/heyhasanhere/API-Reconnaissance/pkg/shape"
+	"time"
 )
 
-// Plan is the output of a Strategy: a list of argv to invoke, an
-// optional environment, and a human-readable note explaining what
-// the command does.
-type Plan struct {
-	Argv []string
-	Env  []string
-	Note string
+// Request is a single download.
+type Request struct {
+	StreamURL  string
+	OutputPath string            // path with extension, or template
+	Headers    map[string]string // injected as --add-header
+	Kind       string            // shape kind: "hls_master", "hls_variant", "dash", "direct", "segment_list"
+	Concurrent int               // HLS/DASH concurrent fragments; default 16
+	Tool       string            // override the binary (default: auto-pick by kind)
+	Stdout     io.Writer         // if nil, discard
+	Stderr     io.Writer         // if nil, os.Stderr
+	ExtraArgs  []string          // appended after the kind-specific args
 }
 
-// Marshal returns the Plan's argv as a single-line, shell-safe
-// string. Used by the REPL to display the command before asking
-// the user to run it.
-func (p Plan) Marshal() string {
-	if len(p.Argv) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i, a := range p.Argv {
-		if i > 0 {
-			b.WriteByte(' ')
-		}
-		// Quote args that contain spaces or shell metacharacters.
-		if needsQuoting(a) {
-			b.WriteByte('\'')
-			b.WriteString(strings.ReplaceAll(a, "'", `'\\''`))
-			b.WriteByte('\'')
-		} else {
-			b.WriteString(a)
-		}
-	}
-	return b.String()
+// Result is what Run returns on success.
+type Result struct {
+	Tool   string
+	Argv   []string
+	Bytes  int64
+	Took   time.Duration
+	Stderr string
 }
 
-func needsQuoting(s string) bool {
-	for _, r := range s {
-		if r <= ' ' || r == '"' || r == '\'' || r == '\\' || r == '$' || r == '`' || r == '&' || r == '|' || r == ';' || r == '<' || r == '>' || r == '*' || r == '?' {
-			return true
+// Run executes the download. Returns an error if the subprocess
+// exits non-zero, the binary is missing, or the context is
+// cancelled.
+func Run(ctx context.Context, req Request) (*Result, error) {
+	if req.StreamURL == "" {
+		return nil, errors.New("download: empty StreamURL")
+	}
+	if req.Concurrent == 0 {
+		req.Concurrent = 16
+	}
+
+	tool, argv := buildArgv(req)
+
+	if req.Tool != "" {
+		tool = req.Tool
+		argv = append([]string{tool}, argv[1:]...) // keep the rest
+	}
+
+	// Verify the tool is installed.
+	if _, err := exec.LookPath(tool); err != nil {
+		return nil, fmt.Errorf("download: %s not found in PATH (install with: %s)",
+			tool, installHint(tool))
+	}
+
+	stdout := req.Stdout
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	stderr := req.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+
+	cmd := exec.CommandContext(ctx, tool, argv[1:]...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	start := time.Now()
+	err := cmd.Run()
+	took := time.Since(start)
+	if err != nil {
+		// Capture stderr for the result if the caller used a
+		// custom writer.
+		if w, ok := stderr.(*strings.Builder); ok {
+			return &Result{Tool: tool, Argv: argv, Took: took, Stderr: w.String()}, err
 		}
+		return &Result{Tool: tool, Argv: argv, Took: took}, err
+	}
+
+	// Best-effort size: stat the output path.
+	var bytes int64
+	if req.OutputPath != "" {
+		if info, err := os.Stat(req.OutputPath); err == nil {
+			bytes = info.Size()
+		}
+	}
+	return &Result{Tool: tool, Argv: argv, Bytes: bytes, Took: took}, nil
+}
+
+// buildArgv returns (tool, full-argv-including-tool). Callers can
+// override the tool via Request.Tool.
+func buildArgv(req Request) (string, []string) {
+	switch req.Kind {
+	case "hls_master", "hls_variant":
+		return buildYTDLP(req, true)
+	case "dash":
+		return buildYTDLP(req, true)
+	case "direct":
+		return buildYTDLP(req, false)
+	case "segment_list":
+		return buildAria2(req)
+	default:
+		// Unknown kind — fall back to yt-dlp.
+		return buildYTDLP(req, false)
+	}
+}
+
+func buildYTDLP(req Request, concurrent bool) (string, []string) {
+	argv := []string{"yt-dlp", "--no-warnings", "--no-progress"}
+	if req.OutputPath != "" {
+		argv = append(argv, "-o", req.OutputPath)
+	}
+	// Headers.
+	for k, v := range req.Headers {
+		// Skip default headers that yt-dlp sets itself
+		// (User-Agent, Accept) to avoid the warning.
+		if isYTDLPDefaultHeader(k) {
+			continue
+		}
+		argv = append(argv, "--add-header", k+":"+v)
+	}
+	if concurrent {
+		argv = append(argv, "--concurrent-fragments", fmt.Sprintf("%d", req.Concurrent))
+	}
+	argv = append(argv, req.ExtraArgs...)
+	argv = append(argv, req.StreamURL)
+	return "yt-dlp", argv
+}
+
+func buildAria2(req Request) (string, []string) {
+	argv := []string{"aria2c", "--console-log-level=warn"}
+	if req.OutputPath != "" {
+		argv = append(argv, "-o", req.OutputPath)
+	}
+	for k, v := range req.Headers {
+		if isYTDLPDefaultHeader(k) {
+			continue
+		}
+		argv = append(argv, "--header", k+": "+v)
+	}
+	argv = append(argv, req.ExtraArgs...)
+	argv = append(argv, req.StreamURL)
+	return "aria2c", argv
+}
+
+// isYTDLPDefaultHeader returns true for headers yt-dlp sets
+// itself, so we don't double-set them (and trigger a warning).
+func isYTDLPDefaultHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "user-agent", "accept", "accept-language":
+		return true
 	}
 	return false
 }
 
-// Run executes the Plan in the foreground. The Plan's stdout/stderr
-// is inherited from the parent process so the user sees the
-// download progress. The function returns when the child exits or
-// the context is cancelled.
-func (p Plan) Run(ctx context.Context) error {
-	if len(p.Argv) == 0 {
-		return fmt.Errorf("download: empty plan")
+func installHint(tool string) string {
+	switch tool {
+	case "yt-dlp":
+		return "pip install yt-dlp  OR  brew install yt-dlp  OR  https://github.com/yt-dlp/yt-dlp#installation"
+	case "aria2c":
+		return "brew install aria2  OR  apt install aria2"
 	}
-	if p.Argv[0] == "" {
-		return fmt.Errorf("download: empty program name")
-	}
-	cmd := exec.CommandContext(ctx, p.Argv[0], p.Argv[1:]...)
-	cmd.Env = append(cmd.Environ(), p.Env...)
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
+	return "(check your package manager)"
 }
 
-// Input is what strategies consume. Shape is the recognized kind;
-// Auth is the captured credentials (for header injection); URL is
-// the URL to download; Body is the response body (some strategies
-// need to parse it for stream keys, segment lists, etc.).
-type Input struct {
-	URL        string
-	Body       []byte
-	Shape      shape.Shape
-	Auth       recipe.Auth
-	OutputPath string
-}
-
-// Strategy produces a Plan from an Input. Returning an error means
-// the strategy can't handle this shape — the dispatcher will skip
-// to the next strategy.
-type Strategy func(ctx context.Context, in Input) (Plan, error)
-
-// dispatchTable is the package-internal table. We populate it
-// from init() to avoid the initialization cycle that would occur
-// if jsonStreamKeyExtract (which references the table) were
-// referenced from a package-level var initializer.
-var dispatchTable map[shape.Kind]Strategy
-
-func init() {
-	dispatchTable = map[shape.Kind]Strategy{
-		shape.KindHLSMaster:   hlsViaYTDLP,
-		shape.KindHLSVariant:  hlsViaYTDLP,
-		shape.KindDASH:        dashViaYTDLP,
-		shape.KindDirect:      directViaCurl,
-		shape.KindSegmentList: segmentListViaAria2,
-		shape.KindHTML:        htmlExtractLinks,
-		shape.KindJSON:        jsonStreamKeyExtract,
+// Argv returns the argv that Run would use, without actually
+// running it. Useful for the dry-run mode and for tests.
+func Argv(req Request) []string {
+	if req.Concurrent == 0 {
+		req.Concurrent = 16
 	}
-}
-
-// Dispatch returns the public table. Tests can mutate the returned
-// map to override strategies.
-func Dispatch() map[shape.Kind]Strategy {
-	return dispatchTable
-}
-
-// PlanFor returns a Plan for the given Input by looking up the
-// strategy in dispatchTable. Returns an error if no strategy is
-// registered for the shape.
-func PlanFor(ctx context.Context, in Input) (Plan, error) {
-	if in.OutputPath == "" {
-		in.OutputPath = "output"
+	_, argv := buildArgv(req)
+	if req.Tool != "" {
+		argv = append([]string{req.Tool}, argv[1:]...)
 	}
-	strat, ok := dispatchTable[in.Shape.Kind]
-	if !ok {
-		return Plan{}, fmt.Errorf("download: no strategy for shape %q", in.Shape.Kind)
-	}
-	return strat(ctx, in)
-}
-
-// hlsViaYTDLP generates a yt-dlp argv for an HLS playlist. This is
-// the anikage case directly: yt-dlp with concurrent fragments
-// and the captured Origin/Referer headers.
-func hlsViaYTDLP(ctx context.Context, in Input) (Plan, error) {
-	argv := []string{"yt-dlp", "--no-warnings", "-o", in.OutputPath}
-	for k, v := range in.Auth.RequiredHeaders {
-		argv = append(argv, "--add-header", k+":"+v)
-	}
-	if in.Shape.Kind == shape.KindHLSMaster {
-		argv = append(argv, "--allow-unplayable-formats")
-	}
-	argv = append(argv, "--concurrent-fragments", "16", in.URL)
-	return Plan{
-		Argv: argv,
-		Note: "yt-dlp with 16 concurrent fragments" + describeAuth(in.Auth),
-	}, nil
-}
-
-// dashViaYTDLP generates a yt-dlp argv for a DASH manifest.
-func dashViaYTDLP(ctx context.Context, in Input) (Plan, error) {
-	argv := []string{"yt-dlp", "--no-warnings", "-o", in.OutputPath}
-	for k, v := range in.Auth.RequiredHeaders {
-		argv = append(argv, "--add-header", k+":"+v)
-	}
-	argv = append(argv, in.URL)
-	return Plan{
-		Argv: argv,
-		Note: "yt-dlp for DASH manifest" + describeAuth(in.Auth),
-	}, nil
-}
-
-// directViaCurl generates a curl argv for a direct file URL (mp4,
-// etc.) with parallel range requests.
-func directViaCurl(ctx context.Context, in Input) (Plan, error) {
-	argv := []string{"curl", "-L", "--fail", "-o", in.OutputPath}
-	for k, v := range in.Auth.RequiredHeaders {
-		argv = append(argv, "-H", k+": "+v)
-	}
-	if in.Auth.BearerToken != "" {
-		argv = append(argv, "-H", "Authorization: Bearer "+in.Auth.BearerToken)
-	}
-	argv = append(argv, in.URL)
-	return Plan{
-		Argv: argv,
-		Note: "curl with -L (follow redirects)" + describeAuth(in.Auth),
-	}, nil
-}
-
-// segmentListViaAria2 generates an aria2c argv for a JSON segment
-// list. We write the segment URLs to a temp file and pass it via
-// --input-file.
-func segmentListViaAria2(ctx context.Context, in Input) (Plan, error) {
-	// Write segment URLs to a tmp file. We use the OutputPath's
-	// directory or /tmp.
-	tmpPath := in.OutputPath + ".segments.txt"
-	if err := writeSegmentList(tmpPath, in.Body); err != nil {
-		return Plan{}, fmt.Errorf("download: write segment list: %w", err)
-	}
-	argv := []string{"aria2c", "-x", "16", "-o", in.OutputPath, "--input-file=" + tmpPath}
-	for k, v := range in.Auth.RequiredHeaders {
-		argv = append(argv, "--header", k+": "+v)
-	}
-	return Plan{
-		Argv: argv,
-		Note: "aria2c with 16 connections per segment" + describeAuth(in.Auth),
-	}, nil
-}
-
-// htmlExtractLinks parses an HTML page and returns the first
-// downloadable <a href> or <a download> link. Used as a fallback
-// when the page is the "real" download entry point.
-func htmlExtractLinks(ctx context.Context, in Input) (Plan, error) {
-	links := findHTMLLinks(string(in.Body))
-	if len(links) == 0 {
-		return Plan{}, fmt.Errorf("download: no <a href> links found in HTML")
-	}
-	// We just return the first; the REPL can present all of them
-	// and let the user pick.
-	link := links[0]
-	argv := []string{"curl", "-L", "-o", in.OutputPath, link}
-	return Plan{
-		Argv: argv,
-		Note: fmt.Sprintf("curl for HTML link (first of %d): %s", len(links), link),
-	}, nil
-}
-
-// jsonStreamKeyExtract handles a JSON response that wraps a stream
-// key (the anikage /sources case: {"sources": [{"url": "..."}]}).
-// The "url" field is a base64-ish key into the CDN proxy, not an
-// actual URL. We need to build the real URL from it and then
-// hand off to the HLS handler.
-func jsonStreamKeyExtract(ctx context.Context, in Input) (Plan, error) {
-	// Find the first sources[].url value.
-	key, host, err := extractStreamKey(in.Body, in.Shape.CrossHost)
-	if err != nil {
-		return Plan{}, fmt.Errorf("download: extract stream key: %w", err)
-	}
-	realURL := buildStreamURL(key, host, in.Auth)
-	// Build a new Input with the resolved URL and re-dispatch.
-	newIn := in
-	newIn.URL = realURL
-	newIn.Body = nil
-	if isLikelyHLSKey(key) {
-		newIn.Shape = shape.Shape{Kind: shape.KindHLSMaster, ContentType: "application/vnd.apple.mpegurl", Status: 200}
-	} else {
-		newIn.Shape = shape.Shape{Kind: shape.KindDirect, ContentType: "video/mp4", Status: 200}
-	}
-	strat, ok := dispatchTable[newIn.Shape.Kind]
-	if !ok {
-		return Plan{}, fmt.Errorf("download: no strategy for resolved shape")
-	}
-	return strat(ctx, newIn)
-}
-
-// describeAuth returns a short string describing which auth is
-// applied. Used in Plan.Note.
-func describeAuth(auth recipe.Auth) string {
-	if auth.BearerToken == "" && len(auth.RequiredHeaders) == 0 && auth.SessionCookie == "" && auth.APIKey == "" {
-		return ""
-	}
-	parts := []string{}
-	if auth.BearerToken != "" {
-		parts = append(parts, "bearer")
-	}
-	if auth.SessionCookie != "" {
-		parts = append(parts, "cookie")
-	}
-	if auth.APIKey != "" {
-		parts = append(parts, "api-key")
-	}
-	if len(auth.RequiredHeaders) > 0 {
-		parts = append(parts, fmt.Sprintf("%d req headers", len(auth.RequiredHeaders)))
-	}
-	return " (" + strings.Join(parts, ", ") + ")"
+	return argv
 }
