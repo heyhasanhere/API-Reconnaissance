@@ -1,7 +1,0 @@
-{
-  "success": false,
-  "error": {
-    "status": 500,
-    "message": "No episodes found for provider pahe"
-  }
-}
