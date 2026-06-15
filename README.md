@@ -86,13 +86,27 @@ If you get "command not found," `$HOME/go/bin` isn't on your
 
 ### Playwright (only if you use `watch` or `click`)
 
+The `watch` and `click` REPL actions spawn a headless Chromium
+via Playwright. This is **only needed in the `api-recon`
+project directory** — that's where the `package.json` lives
+that declares Playwright as a dev dependency. The install
+is one-time, not per-recipe.
+
 ```bash
-npm install && npx playwright install chromium
+cd /path/to/api-recon
+npm install
+npx playwright install chromium
 ```
 
-`api-recon` prints a one-line install hint on REPL startup if
-Playwright is missing. The basic probe/harvest/verify/run path
-doesn't need it.
+Running `npm install` in any other directory will fail with
+`ENOENT: no such file or directory, open '.../package.json'`
+— that's npm saying "I don't know what to install here."
+
+If you cloned via `go install` (no local source), Playwright
+isn't relevant — only the project source tree uses it. The
+`api-recon` REPL prints a one-line install hint on startup
+if Playwright is missing. The basic probe/harvest/verify/run
+path doesn't need it.
 
 ## Usage
 
