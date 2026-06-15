@@ -406,7 +406,7 @@ func TestDecideCandidateBases_BlocksApex(t *testing.T) {
 // TestIsFrameworkHost: the blocklist catches the common vendor
 // hosts found in modern SPA bundles.
 func TestIsFrameworkHost(t *testing.T) {
-	yes := []string{"react.dev", "reactrouter.com", "unpkg.com", "esm.sh", "chiaki.site", "i.ytimg.com"}
+	yes := []string{"react.dev", "reactrouter.com", "unpkg.com", "esm.sh", "chiaki.site", "i.ytimg.com", "github.com", "schema.org"}
 	for _, h := range yes {
 		if !isFrameworkHost(h) {
 			t.Errorf("isFrameworkHost(%q) = false, want true", h)

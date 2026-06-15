@@ -217,6 +217,12 @@ func isFrameworkHost(h string) bool {
 	// Common CDN subdomains that aren't the page's API.
 	case "fonts.gstatic.com", "fonts.googleapis.com":
 		return true
+	// Code-hosting / spec pages that appear as literals in
+	// bundles (link references, source-map URLs, etc.). These
+	// are never API bases.
+	case "github.com", "github.io", "gitlab.com", "bitbucket.org",
+		"schema.org", "w3.org", "mozilla.org":
+		return true
 	}
 	return false
 }
