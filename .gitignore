@@ -1,6 +1,3 @@
-node_modules/
-package-lock.json
-
 # Recipe store temp files
 *.recipe.json.tmp
 
@@ -14,3 +11,4 @@ package-lock.json
 # Build output
 /api-recon
 /mine
+/api-recon.exe
